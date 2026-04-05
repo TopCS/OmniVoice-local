@@ -58,6 +58,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torchaudio
 import uvicorn
@@ -125,7 +126,6 @@ OPENAI_MODEL_STEPS = {
     "tts-1-hd": 32,
 }
 
-OPENAI_KNOWN_VOICES = {"alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"}
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -597,8 +597,11 @@ def _build_gen_kwargs(
     return gen_kwargs
 
 
-def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample_name: Optional[str]) -> Response:
-    """Run model.generate() and return audio Response."""
+def _run_model(gen_kwargs: dict) -> tuple[torch.Tensor, float]:
+    """
+    Run model.generate() and return (audio_tensor, elapsed_seconds).
+    Raises HTTPException on failure.
+    """
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet.")
 
@@ -613,8 +616,52 @@ def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample_name:
     if not audio_tensors:
         raise HTTPException(status_code=500, detail="Model returned empty audio.")
 
-    audio = audio_tensors[0]  # (1, T)
+    return audio_tensors[0], elapsed  # (1, T), seconds
 
+
+def _encode_audio(audio: torch.Tensor, fmt: str, mime_type: str) -> tuple[bytes, str]:
+    """
+    Encode audio tensor to the requested format.
+    Returns (bytes, mime_type).
+    For PCM: raw signed 16-bit little-endian mono.
+    """
+    if fmt == "pcm":
+        samples = audio[0].cpu().float().numpy()
+        samples = np.clip(samples, -1.0, 1.0)
+        pcm_data = (samples * 32767).astype(np.int16).tobytes()
+        return pcm_data, "audio/pcm"
+
+    buf = io.BytesIO()
+    torchaudio.save(buf, audio.cpu(), SAMPLE_RATE, format=fmt)
+    buf.seek(0)
+    return buf.read(), mime_type
+
+
+def _audio_response(audio: torch.Tensor, elapsed: float, fmt: str, mime_type: str, log_tag: str = "") -> Response:
+    """Build a Response from an audio tensor with timing headers."""
+    content, actual_mime = _encode_audio(audio, fmt, mime_type)
+    duration_s = audio.shape[-1] / SAMPLE_RATE
+    rtf = elapsed / max(duration_s, 0.001)
+
+    log.info(
+        "%sGenerated %.2fs audio in %.2fs (RTF=%.3f) format=%s",
+        f"[{log_tag}] " if log_tag else "",
+        duration_s, elapsed, rtf, fmt,
+    )
+
+    return Response(
+        content=content,
+        media_type=actual_mime,
+        headers={
+            "X-Audio-Duration": f"{duration_s:.3f}",
+            "X-Generation-Time": f"{elapsed:.3f}",
+            "X-RTF": f"{rtf:.4f}",
+        },
+    )
+
+
+def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample_name: Optional[str]) -> Response:
+    """Run model.generate() and return audio Response."""
     fmt = (output_format or DEFAULT_OUTPUT_FORMAT).lower()
     if fmt not in MIME_TYPES:
         raise HTTPException(
@@ -622,26 +669,8 @@ def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample_name:
             detail=f"Unsupported output format '{fmt}'. Use: {list(MIME_TYPES.keys())}",
         )
 
-    buf = io.BytesIO()
-    torchaudio.save(buf, audio.cpu(), SAMPLE_RATE, format=fmt)
-    buf.seek(0)
-
-    duration_s = audio.shape[-1] / SAMPLE_RATE
-    log.info(
-        "Generated %.2fs audio in %.2fs (RTF=%.3f) format=%s sample=%s",
-        duration_s, elapsed, elapsed / max(duration_s, 0.001), fmt,
-        sample_name or "(none)",
-    )
-
-    return Response(
-        content=buf.read(),
-        media_type=MIME_TYPES[fmt],
-        headers={
-            "X-Audio-Duration": f"{duration_s:.3f}",
-            "X-Generation-Time": f"{elapsed:.3f}",
-            "X-RTF": f"{elapsed / max(duration_s, 0.001):.4f}",
-        },
-    )
+    audio, elapsed = _run_model(gen_kwargs)
+    return _audio_response(audio, elapsed, fmt, MIME_TYPES[fmt], log_tag=sample_name or "")
 
 
 # ---------------------------------------------------------------------------
@@ -806,63 +835,18 @@ async def openai_speech(req: OpenAISpeechRequest, _: None = Depends(require_api_
     # Map model name to diffusion steps
     num_step = OPENAI_MODEL_STEPS.get(req.model)
 
-    gen_kwargs = _build_gen_kwargs(
-        text=req.input,
-        sample=matched_sample,
-        speed=req.speed,
-        num_step=num_step,
-    )
-
-    if model is None:
-        return _openai_error(503, "Model not loaded yet.", error_type="server_error")
-
-    t0 = time.monotonic()
     try:
-        audio_tensors = model.generate(**gen_kwargs)
-    except Exception as exc:
-        log.exception("OpenAI-compat generation failed")
-        return _openai_error(500, f"Generation error: {exc}", error_type="server_error")
-    elapsed = time.monotonic() - t0
-
-    if not audio_tensors:
-        return _openai_error(500, "Model returned empty audio.", error_type="server_error")
-
-    audio = audio_tensors[0]  # (1, T)
-    duration_s = audio.shape[-1] / SAMPLE_RATE
-
-    log.info(
-        "[openai] Generated %.2fs audio in %.2fs (RTF=%.3f) fmt=%s voice=%s model=%s",
-        duration_s, elapsed, elapsed / max(duration_s, 0.001),
-        fmt_key, req.voice, req.model,
-    )
-
-    if internal_fmt == "pcm":
-        # Raw signed 16-bit little-endian PCM at SAMPLE_RATE Hz, mono
-        import numpy as np
-        pcm_data = (audio[0].cpu().numpy() * 32767).astype(np.int16).tobytes()
-        return Response(
-            content=pcm_data,
-            media_type="audio/pcm",
-            headers={
-                "X-Audio-Duration": f"{duration_s:.3f}",
-                "X-Generation-Time": f"{elapsed:.3f}",
-                "X-RTF": f"{elapsed / max(duration_s, 0.001):.4f}",
-            },
+        gen_kwargs = _build_gen_kwargs(
+            text=req.input,
+            sample=matched_sample,
+            speed=req.speed,
+            num_step=num_step,
         )
+        audio, elapsed = _run_model(gen_kwargs)
+    except HTTPException as exc:
+        return _openai_error(exc.status_code, exc.detail if isinstance(exc.detail, str) else str(exc.detail), error_type="server_error")
 
-    buf = io.BytesIO()
-    torchaudio.save(buf, audio.cpu(), SAMPLE_RATE, format=internal_fmt)
-    buf.seek(0)
-
-    return Response(
-        content=buf.read(),
-        media_type=mime_type,
-        headers={
-            "X-Audio-Duration": f"{duration_s:.3f}",
-            "X-Generation-Time": f"{elapsed:.3f}",
-            "X-RTF": f"{elapsed / max(duration_s, 0.001):.4f}",
-        },
-    )
+    return _audio_response(audio, elapsed, internal_fmt, mime_type, log_tag=f"openai voice={req.voice} model={req.model}")
 
 
 @app.get("/v1/models", tags=["OpenAI-compatible"])
