@@ -11,6 +11,7 @@ services:
     volumes:
       - ./app:/app
       - ./samples:/samples
+      - ./outputs:/tmp/gradio
       # Pre-downloaded model directory (optional).
       # If not mounted, the model will be downloaded from HuggingFace
       # into the HF cache inside the container on first start.
