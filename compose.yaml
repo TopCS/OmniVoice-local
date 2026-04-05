@@ -1,0 +1,50 @@
+services:
+  omnivoice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: omnivoice-tts
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    volumes:
+      - ./app:/app
+      - ./samples:/samples
+      # Pre-downloaded model directory (optional).
+      # If not mounted, the model will be downloaded from HuggingFace
+      # into the HF cache inside the container on first start.
+      # To use a local model, uncomment and set the path:
+      # - /path/to/OmniVoice:/models/OmniVoice
+    environment:
+      - OMNIVOICE_MODEL=k2-fsa/OmniVoice
+      - OMNIVOICE_DEVICE=cuda:0
+      - OMNIVOICE_DTYPE=float16
+      - OMNIVOICE_SAMPLES_DIR=/samples
+      - OMNIVOICE_HOST=0.0.0.0
+      - OMNIVOICE_PORT=8000
+      - OMNIVOICE_OUTPUT_FORMAT=wav
+      - OMNIVOICE_GRADIO_ENABLED=true
+      - OMNIVOICE_GRADIO_PORT=8001
+      # Uncomment for local model:
+      # - OMNIVOICE_MODEL=/models/OmniVoice
+      # Uncomment for HuggingFace mirror:
+      # - HF_ENDPOINT=https://hf-mirror.com
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
