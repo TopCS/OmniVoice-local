@@ -261,6 +261,12 @@ curl -X POST http://localhost:8000/tts \
 
 The server exposes a drop-in replacement for the OpenAI TTS API, so any client that works with `https://api.openai.com` can be pointed at this server instead.
 
+### Limitations compared to OpenAI API
+
+- **No voice listing endpoint.** The OpenAI API standard does not define an endpoint for listing available voices (there is no `GET /v1/voices`). To discover which voices are loaded, use OmniVoice's native `GET /samples` endpoint (see [Samples Management](#samples-management) below).
+- **Voice names are not restricted to the standard set.** OpenAI's API documents a fixed set of voices (`alloy`, `ash`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer`), but OmniVoice accepts **any** voice name that matches a loaded sample file. For example, if you place `my-custom-voice.wav` in the samples directory, `"voice": "my-custom-voice"` will work.
+- **Silent fallback on unknown voice.** If the `voice` value does not match any loaded sample, the request does **not** fail — it silently falls back to auto-voice mode (model picks a random voice). This differs from the `/tts` endpoint, which returns a 404 error with a list of available samples.
+
 ### `POST /v1/audio/speech`
 
 Identical contract to the [OpenAI TTS endpoint](https://platform.openai.com/docs/api-reference/audio/createSpeech).
