@@ -271,7 +271,7 @@ Identical contract to the [OpenAI TTS endpoint](https://platform.openai.com/docs
 |---|---|---|---|
 | `model` | string | yes | `tts-1` (fast, 16 steps) or `tts-1-hd` (quality, 32 steps) |
 | `input` | string | yes | Text to synthesize. Max 4096 characters. |
-| `voice` | string | yes | Voice name. If a sample with this name is loaded, voice cloning is used. Otherwise auto-voice mode. Standard OpenAI voices (`alloy`, `echo`, `fable`, `nova`, `onyx`, `shimmer`, etc.) work when matching samples exist. |
+| `voice` | string | yes | Voice name. If a sample with this name is loaded, voice cloning is used. Otherwise auto-voice mode. Standard OpenAI voices (`alloy`, `echo`, `fable`, `nova`, `onyx`, `shimmer`, etc.) **work when matching samples exist.** |
 | `response_format` | string | no | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm`. Note: `aac` is served as mp3. |
 | `speed` | float | no | Speech speed factor (0.25–4.0). |
 
