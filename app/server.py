@@ -593,7 +593,7 @@ def _launch_wyoming_server() -> _WyomingServer:
 def _wyoming_info_event() -> dict:
     speakers = [{"name": s} for s in sorted(voice_samples.keys())]
     languages = _resolve_wyoming_languages()
-    model_info = {
+    voice_info = {
         "name": "omnivoice",
         "languages": languages,
         "attribution": {
@@ -604,14 +604,24 @@ def _wyoming_info_event() -> dict:
         "description": "OmniVoice zero-shot multilingual TTS",
     }
     if speakers:
-        model_info["speakers"] = speakers
+        voice_info["speakers"] = speakers
+
+    tts_program = {
+        "name": "omnivoice",
+        "attribution": {
+            "name": "OmniVoice Local Server",
+            "url": "https://github.com/k2-fsa/OmniVoice",
+        },
+        "installed": True,
+        "description": "OmniVoice Wyoming TTS service",
+        "voices": [voice_info],
+        "supports_synthesize_streaming": True,
+    }
+
     return {
         "type": "info",
         "data": {
-            "tts": [{
-                "models": [model_info],
-                "supports_synthesize_streaming": True,
-            }]
+            "tts": [tts_program]
         },
     }
 
