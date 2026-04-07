@@ -557,6 +557,7 @@ class _WyomingServer:
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         synth_state = {"voice": None, "chunks": []}
+        synthesized = False  # track whether we already synthesized in this connection
         peer = writer.get_extra_info("peername")
         log.info("Wyoming client connected: %s", peer)
         try:
@@ -566,14 +567,19 @@ class _WyomingServer:
                     break
                 event_type = event.get("type")
                 data = event.get("data") or {}
+                log.debug("Wyoming event from %s: %s", peer, event_type)
 
                 if event_type == "describe":
                     await _wyoming_send_event(writer, _wyoming_info_event())
                 elif event_type == "synthesize":
+                    if synthesized:
+                        log.debug("Skipping duplicate synthesize event from %s", peer)
+                        continue
                     text = str(data.get("text", "")).strip()
                     if text:
                         voice = data.get("voice")
                         await _wyoming_send_tts(writer, text, voice)
+                        synthesized = True
                 elif event_type == "synthesize-start":
                     synth_state["voice"] = data.get("voice")
                     synth_state["chunks"] = []
@@ -582,9 +588,13 @@ class _WyomingServer:
                     if chunk:
                         synth_state["chunks"].append(chunk)
                 elif event_type == "synthesize-stop":
-                    text = "".join(synth_state["chunks"]).strip()
-                    if text:
-                        await _wyoming_send_tts(writer, text, synth_state["voice"])
+                    if synthesized:
+                        log.debug("Skipping duplicate streaming synthesize from %s", peer)
+                    else:
+                        text = "".join(synth_state["chunks"]).strip()
+                        if text:
+                            await _wyoming_send_tts(writer, text, synth_state["voice"])
+                            synthesized = True
                     await _wyoming_send_event(writer, {"type": "synthesize-stopped"})
                     synth_state["voice"] = None
                     synth_state["chunks"] = []
