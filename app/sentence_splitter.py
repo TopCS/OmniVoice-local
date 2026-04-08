@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Iterable
 
 _TERMINAL_PUNCT = {".", "!", "?", "。", "！", "？", ";", ":"}
 _ABBREVIATIONS = {
     "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "st.", "vs.", "etc.", "e.g.", "i.e.",
 }
+_TAG_RE = re.compile(r"\[[^\[\]\n]+\]")
+
+
 @dataclass
 class SentenceSplitter:
     """Split text into TTS-friendly chunks with min/max length controls."""
@@ -26,7 +30,7 @@ class SentenceSplitter:
         raw_sentences, remainder = self.extract_complete_sentences(stripped)
         if remainder:
             raw_sentences.append(remainder.strip())
-        return self.post_process(raw_sentences)
+        return self._post_process(raw_sentences)
 
     def extract_complete_sentences(self, buffer: str) -> tuple[list[str], str]:
         """Return complete sentences detected in buffer and leftover tail."""
@@ -64,12 +68,7 @@ class SentenceSplitter:
         remainder = buffer[prev:]
         return sentences, remainder
 
-    def process_stream_buffer(self, buffer: str) -> tuple[list[str], str]:
-        """Extract complete sentences from streaming buffer and post-process them."""
-        complete, remainder = self.extract_complete_sentences(buffer)
-        return self.post_process(complete), remainder
-
-    def post_process(self, sentences: Iterable[str]) -> list[str]:
+    def _post_process(self, sentences: Iterable[str]) -> list[str]:
         result: list[str] = []
         pending = ""
 
