@@ -40,9 +40,6 @@ class WSSessionState:
     prompt_sample: Optional[str] = None
     prompt_text: Optional[str] = None
     voice_clone_prompt: Any = None
-    output_format: str = "pcm"
-    num_step: Optional[int] = None
-    speed: Optional[float] = None
     opened_at: float = field(default_factory=time.monotonic)
 
 
@@ -95,10 +92,7 @@ def create_ws_router(
                             config,
                         )
                     continue
-                try:
-                    await _handle_message(websocket, msg, state, splitter, get_model, get_voice_samples, model_lock, config)
-                except RuntimeError as exc:
-                    await _send_error(websocket, str(exc), "MESSAGE_ERROR")
+                await _handle_message(websocket, msg, state, splitter, get_model, get_voice_samples, model_lock, config)
         except WebSocketDisconnect:
             log.info("WS disconnected by client %s", websocket.client)
         except Exception as exc:  # noqa: BLE001
@@ -136,7 +130,6 @@ async def _handle_message(
         if not text:
             await _send_error(websocket, "Field 'text' must not be empty.", "INVALID_TEXT")
             return
-        _update_session_options(state, message, config)
         await _ensure_voice_prompt(message, state, get_model, get_voice_samples, model_lock)
         sentences = splitter.split_text(text)
         await _synthesize_sentences(websocket, sentences, message, state, get_model, model_lock, config)
@@ -147,12 +140,12 @@ async def _handle_message(
         chunk = str(message.get("text", ""))
         if not chunk:
             return
-        _update_session_options(state, message, config)
         await _ensure_voice_prompt(message, state, get_model, get_voice_samples, model_lock)
         state.text_buffer += chunk
-        complete, state.text_buffer = splitter.process_stream_buffer(state.text_buffer)
+        complete, remainder = splitter.extract_complete_sentences(state.text_buffer)
+        state.text_buffer = remainder
         if complete:
-            await _synthesize_sentences(websocket, complete, message, state, get_model, model_lock, config)
+            await _synthesize_sentences(websocket, splitter._post_process(complete), message, state, get_model, model_lock, config)
         return
 
     if msg_type == "text_flush":
@@ -164,7 +157,6 @@ async def _handle_message(
         return
 
     if msg_type == "set_voice":
-        _update_session_options(state, message, config)
         await _ensure_voice_prompt(message, state, get_model, get_voice_samples, model_lock, force=True)
         await websocket.send_json({"type": "voice_set", "sample": state.prompt_sample})
         return
@@ -181,19 +173,18 @@ async def _synthesize_sentences(
     model_lock: asyncio.Lock,
     config: WSConfig,
 ) -> None:
-    output_format = str(message.get("output_format") or state.output_format or "pcm").lower()
+    output_format = str(message.get("output_format") or "pcm").lower()
     if output_format not in {"pcm", "wav"}:
         await _send_error(websocket, f"Unsupported output_format '{output_format}'.", "UNSUPPORTED_FORMAT")
         return
 
-    for idx, sentence in enumerate(sentences):
+    for sentence in sentences:
         gen_kwargs = {
             "text": sentence,
-            "num_step": int(message.get("num_step") or state.num_step or config.default_num_step),
+            "num_step": int(message.get("num_step") or config.default_num_step),
         }
-        speed = message.get("speed", state.speed)
-        if speed is not None:
-            gen_kwargs["speed"] = float(speed)
+        if message.get("speed") is not None:
+            gen_kwargs["speed"] = float(message["speed"])
         if state.voice_clone_prompt is not None:
             gen_kwargs["voice_clone_prompt"] = state.voice_clone_prompt
         elif message.get("instruct"):
@@ -205,7 +196,7 @@ async def _synthesize_sentences(
         duration_ms = int(audio.shape[-1] * 1000 / config.sample_rate)
 
         payload = encode_audio_chunk(audio, output_format=output_format, sample_rate=config.sample_rate)
-        is_last = idx == len(sentences) - 1
+        is_last = sentence == sentences[-1]
         await websocket.send_json(
             {
                 "type": "audio_chunk",
@@ -272,18 +263,6 @@ async def _ensure_voice_prompt(
         state.voice_clone_prompt = await asyncio.to_thread(model.create_voice_clone_prompt, **kwargs)
     state.prompt_sample = sample_name
     state.prompt_text = ref_text
-
-
-def _update_session_options(state: WSSessionState, message: dict[str, Any], config: WSConfig) -> None:
-    """Persist session defaults so streaming clients don't resend options per token."""
-    if message.get("output_format") is not None:
-        state.output_format = str(message["output_format"]).lower()
-    if message.get("num_step") is not None:
-        state.num_step = int(message["num_step"])
-    elif state.num_step is None:
-        state.num_step = config.default_num_step
-    if message.get("speed") is not None:
-        state.speed = float(message["speed"])
 
 
 async def _recv_json(websocket: WebSocket, timeout_s: float, idle_timeout_s: int) -> Optional[dict[str, Any]]:

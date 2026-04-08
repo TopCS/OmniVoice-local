@@ -40,7 +40,7 @@ def test_buffer_accumulation_min_chars():
     splitter = SentenceSplitter(max_chars=150, min_chars=20)
     complete, rem = splitter.extract_complete_sentences("Hi. Ok. This is the long part.")
     assert rem == ""
-    merged = splitter.post_process(complete)
+    merged = splitter._post_process(complete)
     assert len(merged) == 1
 
 
