@@ -49,6 +49,11 @@ Environment variables:
                                (default: empty = CORS disabled)
     OMNIVOICE_MAX_UPLOAD_BYTES - Max text file upload size in bytes
                                (default: 10485760 = 10 MB)
+    OMNIVOICE_WS_ENABLED      - Enable /ws/tts endpoint (default: true)
+    OMNIVOICE_WS_DEFAULT_NUM_STEP - Default WS diffusion steps (default: 16)
+    OMNIVOICE_WS_MAX_SENTENCE_CHARS - WS max sentence length (default: 150)
+    OMNIVOICE_WS_MIN_SENTENCE_CHARS - WS min sentence length (default: 20)
+    OMNIVOICE_WS_BUFFER_TIMEOUT_MS - Flush text buffer timeout in streaming mode (default: 2000)
 """
 
 import hmac
@@ -73,6 +78,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
+from ws_handler import WSConfig, create_ws_router
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -109,6 +115,11 @@ WYOMING_LANGUAGES = os.environ.get("OMNIVOICE_WYOMING_LANGUAGES", _OMNIVOICE_DEF
 API_KEY = os.environ.get("OMNIVOICE_API_KEY", "").strip()
 CORS_ORIGINS = os.environ.get("OMNIVOICE_CORS_ORIGINS", "").strip()
 MAX_UPLOAD_BYTES = int(os.environ.get("OMNIVOICE_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+WS_ENABLED = os.environ.get("OMNIVOICE_WS_ENABLED", "true").lower() in ("true", "1", "yes")
+WS_DEFAULT_NUM_STEP = int(os.environ.get("OMNIVOICE_WS_DEFAULT_NUM_STEP", "16"))
+WS_MAX_SENTENCE_CHARS = int(os.environ.get("OMNIVOICE_WS_MAX_SENTENCE_CHARS", "150"))
+WS_MIN_SENTENCE_CHARS = int(os.environ.get("OMNIVOICE_WS_MIN_SENTENCE_CHARS", "20"))
+WS_BUFFER_TIMEOUT_MS = int(os.environ.get("OMNIVOICE_WS_BUFFER_TIMEOUT_MS", "2000"))
 
 DTYPE_MAP = {
     "float16": torch.float16,
@@ -402,6 +413,14 @@ class OpenAISpeechRequest(BaseModel):
 model = None
 voice_samples: dict = {}
 wyoming_server = None
+model_lock: asyncio.Lock = asyncio.Lock()
+active_ws_connections = 0
+
+
+def _inc_active_ws(delta: int) -> None:
+    """Increment/decrement active WebSocket connection count."""
+    global active_ws_connections
+    active_ws_connections = max(0, active_ws_connections + delta)
 
 
 @asynccontextmanager
@@ -459,6 +478,24 @@ app = FastAPI(
     ),
     version="1.0.0",
     lifespan=lifespan,
+)
+
+ws_config = WSConfig(
+    enabled=WS_ENABLED,
+    default_num_step=WS_DEFAULT_NUM_STEP,
+    max_sentence_chars=WS_MAX_SENTENCE_CHARS,
+    min_sentence_chars=WS_MIN_SENTENCE_CHARS,
+    buffer_timeout_ms=WS_BUFFER_TIMEOUT_MS,
+    sample_rate=SAMPLE_RATE,
+)
+app.include_router(
+    create_ws_router(
+        get_model=lambda: model,
+        get_voice_samples=lambda: voice_samples,
+        model_lock=model_lock,
+        config=ws_config,
+        active_counter=_inc_active_ws,
+    )
 )
 
 # CORS middleware (enabled when OMNIVOICE_CORS_ORIGINS is set)
@@ -698,7 +735,7 @@ async def _wyoming_send_tts(writer: asyncio.StreamWriter, text: str, voice: Opti
 
     try:
         gen_kwargs = _build_gen_kwargs(text=text, sample=sample if sample in voice_samples else None)
-        audio, elapsed = _run_model(gen_kwargs)
+        audio, elapsed = await _run_model_async(gen_kwargs)
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
         log.warning("[wyoming] TTS generation refused: %s", detail)
@@ -778,11 +815,14 @@ async def health():
     return JSONResponse(
         status_code=status_code,
         content={
-            "status": "ok" if ready else "loading",
+            "status": "ready" if ready else "loading",
+            "model_loaded": ready,
             "model": MODEL_ID,
             "device": DEVICE,
             "gradio_enabled": GRADIO_ENABLED,
             "gradio_port": GRADIO_PORT if GRADIO_ENABLED else None,
+            "websocket_enabled": WS_ENABLED,
+            "active_ws_connections": active_ws_connections,
         },
     )
 
@@ -905,6 +945,28 @@ def _run_model(gen_kwargs: dict) -> tuple[torch.Tensor, float]:
     return audio_tensors[0], elapsed  # (1, T), seconds
 
 
+async def _run_model_async(gen_kwargs: dict) -> tuple[torch.Tensor, float]:
+    """
+    Async wrapper around model.generate() serialized by a global asyncio lock.
+    """
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet.")
+
+    t0 = time.monotonic()
+    try:
+        async with model_lock:
+            audio_tensors = await asyncio.to_thread(model.generate, **gen_kwargs)
+    except Exception as exc:
+        log.exception("Generation failed")
+        raise HTTPException(status_code=500, detail=f"Generation error: {exc}")
+    elapsed = time.monotonic() - t0
+
+    if not audio_tensors:
+        raise HTTPException(status_code=500, detail="Model returned empty audio.")
+
+    return audio_tensors[0], elapsed
+
+
 def _encode_audio(audio: torch.Tensor, fmt: str, mime_type: str) -> tuple[bytes, str]:
     """
     Encode audio tensor to the requested format.
@@ -946,7 +1008,7 @@ def _audio_response(audio: torch.Tensor, elapsed: float, fmt: str, mime_type: st
     )
 
 
-def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample_name: Optional[str]) -> Response:
+async def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample_name: Optional[str]) -> Response:
     """Run model.generate() and return audio Response."""
     fmt = (output_format or DEFAULT_OUTPUT_FORMAT).lower()
     if fmt not in MIME_TYPES:
@@ -955,7 +1017,7 @@ def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample_name:
             detail=f"Unsupported output format '{fmt}'. Use: {list(MIME_TYPES.keys())}",
         )
 
-    audio, elapsed = _run_model(gen_kwargs)
+    audio, elapsed = await _run_model_async(gen_kwargs)
     return _audio_response(audio, elapsed, fmt, MIME_TYPES[fmt], log_tag=sample_name or "")
 
 
@@ -995,7 +1057,7 @@ async def synthesize(req: TTSRequest, _: None = Depends(require_api_key)):
         audio_chunk_duration=req.audio_chunk_duration,
         audio_chunk_threshold=req.audio_chunk_threshold,
     )
-    return _generate_audio(gen_kwargs, req.output_format, req.sample)
+    return await _generate_audio(gen_kwargs, req.output_format, req.sample)
 
 
 @app.post("/tts/file", tags=["TTS"])
@@ -1063,7 +1125,7 @@ async def synthesize_from_file(
         audio_chunk_duration=audio_chunk_duration,
         audio_chunk_threshold=audio_chunk_threshold,
     )
-    return _generate_audio(gen_kwargs, output_format, sample)
+    return await _generate_audio(gen_kwargs, output_format, sample)
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1193,7 @@ async def openai_speech(req: OpenAISpeechRequest, _: None = Depends(require_api_
             speed=req.speed,
             num_step=num_step,
         )
-        audio, elapsed = _run_model(gen_kwargs)
+        audio, elapsed = await _run_model_async(gen_kwargs)
     except HTTPException as exc:
         return _openai_error(exc.status_code, exc.detail if isinstance(exc.detail, str) else str(exc.detail), error_type="server_error")
     except Exception as exc:
