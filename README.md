@@ -12,6 +12,7 @@ The server loads OmniVoice once and exposes it through four interfaces simultane
 - **REST API** (port `8000`) — FastAPI with JSON and multipart/form-data endpoints, full parameter control
 - **OpenAI-Compatible API** (port `8000`) — drop-in replacement for the OpenAI TTS API (`/v1/audio/speech`, `/v1/models`), works with the official OpenAI SDK
 - **Wyoming TCP API** (port `10200`) — Home Assistant compatible TTS service for Assist pipelines
+- **WebSocket Streaming API** (port `8000`) — sentence-level progressive audio streaming (`/ws/tts`)
 
 All four share the same model instance — no extra VRAM.
 
@@ -94,6 +95,60 @@ Supported events:
 - `synthesize-start`/`synthesize-chunk`/`synthesize-stop` streaming text mode
 
 ## API Reference
+
+## WebSocket Streaming API
+
+Endpoint: `ws://localhost:8000/ws/tts`
+
+Supported inbound messages:
+
+- `{"type":"synthesize","text":"...","sample":"optional","instruct":"optional","output_format":"pcm|wav","num_step":16,"speed":1.0}`
+- `{"type":"text_chunk","text":"..."}` (incremental LLM token stream mode)
+- `{"type":"text_flush"}` (force synthesis of buffered text)
+- `{"type":"set_voice","sample":"my-voice","ref_text":"optional override"}`
+
+Server outbound messages:
+
+- `audio_chunk` JSON metadata message followed by a binary audio message (`pcm` or `wav`) for each synthesized sentence.
+- `done` once the current synthesis operation is complete.
+- `error` for invalid messages / unknown samples.
+
+Voice clone prompts are cached per WebSocket session and reused for each chunk until `set_voice` is called again.
+
+### Quick `websocat` example
+
+```bash
+websocat ws://localhost:8000/ws/tts
+{"type":"synthesize","text":"Ciao! Come posso aiutarti oggi?","sample":"agent-voice","output_format":"pcm"}
+```
+
+### Minimal Python client example
+
+```python
+import asyncio
+import json
+import websockets
+
+async def main():
+    async with websockets.connect("ws://localhost:8000/ws/tts") as ws:
+        await ws.send(json.dumps({
+            "type": "synthesize",
+            "text": "Hello! This is sentence streaming.",
+            "output_format": "pcm",
+            "num_step": 16
+        }))
+        while True:
+            message = await ws.recv()
+            if isinstance(message, bytes):
+                print("audio bytes:", len(message))
+                continue
+            event = json.loads(message)
+            print(event)
+            if event.get("type") == "done":
+                break
+
+asyncio.run(main())
+```
 
 ### `GET /health`
 

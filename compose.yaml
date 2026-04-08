@@ -28,6 +28,11 @@ services:
       - OMNIVOICE_WYOMING_ENABLED=true
       - OMNIVOICE_WYOMING_HOST=0.0.0.0
       - OMNIVOICE_WYOMING_PORT=10200
+      - OMNIVOICE_WS_ENABLED=true
+      - OMNIVOICE_WS_DEFAULT_NUM_STEP=16
+      - OMNIVOICE_WS_MAX_SENTENCE_CHARS=150
+      - OMNIVOICE_WS_MIN_SENTENCE_CHARS=20
+      - OMNIVOICE_WS_BUFFER_TIMEOUT_MS=2000
       # Uncomment for local model:
       # - OMNIVOICE_MODEL=/models/OmniVoice
       # Uncomment for HuggingFace mirror:
