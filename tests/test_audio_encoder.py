@@ -1,33 +1,64 @@
 from pathlib import Path
 import sys
 import struct
+import types
 import wave
 
-import pytest
+import numpy as np
 
-torch = pytest.importorskip("torch")
+try:
+    import torch  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - local test fallback
+    torch = None
+    sys.modules["torch"] = types.SimpleNamespace(Tensor=object)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from audio_encoder import encode_audio_chunk, tensor_to_pcm16
 
 
+class FakeTensor:
+    def __init__(self, values):
+        self._values = np.array(values, dtype=np.float32)
+
+    def __getitem__(self, idx):
+        return FakeTensor(self._values[idx])
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def float(self):
+        return self
+
+    def numpy(self):
+        return self._values
+
+
+def _tensor(values):
+    if torch is not None:
+        return torch.tensor(values, dtype=torch.float32)
+    return FakeTensor(values)
+
+
 def test_tensor_to_pcm16_length_and_type():
-    audio = torch.tensor([[0.0, 0.5, -0.5, 1.0, -1.0]], dtype=torch.float32)
+    audio = _tensor([[0.0, 0.5, -0.5, 1.0, -1.0]])
     pcm = tensor_to_pcm16(audio)
     assert isinstance(pcm, bytes)
     assert len(pcm) == 10
 
 
 def test_encode_pcm_matches_expected_samples():
-    audio = torch.tensor([[0.0, 1.0, -1.0]], dtype=torch.float32)
+    audio = _tensor([[0.0, 1.0, -1.0]])
     pcm = encode_audio_chunk(audio, output_format="pcm")
     values = struct.unpack("<hhh", pcm)
     assert list(values) == [0, 32767, -32767]
 
 
 def test_encode_wav_is_valid_chunk_file(tmp_path):
-    audio = torch.zeros((1, 2400), dtype=torch.float32)
+    audio = _tensor(np.zeros((1, 2400), dtype=np.float32))
     wav_bytes = encode_audio_chunk(audio, output_format="wav", sample_rate=24000)
     wav_path = tmp_path / "chunk.wav"
     wav_path.write_bytes(wav_bytes)
