@@ -100,7 +100,7 @@ Supported events:
 
 Endpoint: `ws://localhost:8000/ws/tts`
 
-Current auth behavior: `/ws/tts` does not enforce `OMNIVOICE_API_KEY`. REST and OpenAI-style HTTP endpoints can be protected with bearer-token auth when `OMNIVOICE_API_KEY` is set, but the current WebSocket implementation accepts direct connections without WebSocket authentication headers or tokens.
+Current auth behavior: both `/ws/tts` and `/ws/conversation` currently bypass `OMNIVOICE_API_KEY`. REST and OpenAI-style HTTP endpoints can be protected with bearer-token auth when `OMNIVOICE_API_KEY` is set, but the current WebSocket implementation accepts direct connections without WebSocket authentication headers or tokens.
 
 Supported inbound messages:
 
@@ -145,6 +145,69 @@ python examples/ws_playback_client.py \
 ```
 
 The client prints each `audio_chunk` / `done` event as JSON and plays the matching binary PCM frames through the local speakers.
+
+### Experimental full duplex conversation client
+
+`examples/ws_duplex_client.py` is an experimental workstation-side client for `/ws/conversation`. It captures 16 kHz microphone audio, uses local Silero VAD to bracket turns, and plays the assistant's streamed 24 kHz PCM response through the local speakers.
+
+Caveats:
+
+- The client is experimental and documents the current reference flow rather than a stable public interface.
+- It assumes a 16 kHz mono microphone uplink and 24 kHz mono PCM speaker playback.
+- `/ws/conversation` currently bypasses `OMNIVOICE_API_KEY`, so the example connects directly without sending an API key.
+- The smoke flow below is an operator runbook for a real workstation/server setup and was not manually validated in this environment.
+
+Workstation dependencies:
+
+- `websockets`
+- `pyaudio`
+- `silero-vad`
+- `torch`
+
+```bash
+python -m pip install websockets pyaudio silero-vad torch
+```
+
+Server-side conversation dependencies:
+
+- `faster-whisper`
+- `ollama` Python client
+- Reachable Ollama server
+
+```bash
+python -m pip install faster-whisper ollama
+```
+
+The server-side conversation path uses `faster-whisper` for ASR and Ollama for assistant text generation. By default it connects to `OMNIVOICE_OLLAMA_HOST=http://localhost:11434` and requests `OMNIVOICE_OLLAMA_MODEL=gemma4`.
+
+Example invocation:
+
+```bash
+python examples/ws_duplex_client.py \
+  --url ws://server-host:8000/ws/conversation \
+  --sample your-sample-name
+```
+
+Manual duplex smoke flow for a real workstation + server setup:
+
+```bash
+# Prerequisite: start or point to a reachable Ollama server and ensure the model exists.
+# Example:
+#   export OMNIVOICE_OLLAMA_HOST=http://localhost:11434
+#   ollama pull gemma4
+docker compose up -d --build
+python examples/ws_duplex_client.py \
+  --url ws://localhost:8000/ws/conversation \
+  --sample your-sample-name
+```
+
+Expected behavior:
+
+- The operator speaks first to start the turn.
+- The assistant responds after that utterance is transcribed.
+- The user barges in while playback is active.
+- Local playback stops immediately.
+- A new assistant response starts after the interruption turn is transcribed.
 
 ### Manual real-stack smoke test
 
@@ -550,7 +613,7 @@ curl -X POST http://localhost:8000/tts \
   -o output.wav
 ```
 
-`GET /health` is always open so Docker/Podman healthchecks continue to work without credentials. The current `/ws/tts` WebSocket endpoint is also unauthenticated and does not enforce `OMNIVOICE_API_KEY`.
+`GET /health` is always open so Docker/Podman healthchecks continue to work without credentials. The current `/ws/tts` and `/ws/conversation` WebSocket endpoints are also unauthenticated and do not enforce `OMNIVOICE_API_KEY`.
 
 **Setup:**
 
@@ -584,6 +647,12 @@ All configuration is via environment variables (set in `compose.yaml` or `.env`)
 | `OMNIVOICE_API_KEY` | _(unset)_ | API key for bearer-token auth. Unset = auth disabled |
 | `OMNIVOICE_CORS_ORIGINS` | _(empty)_ | Comma-separated list of allowed CORS origins. Empty = CORS disabled |
 | `OMNIVOICE_MAX_UPLOAD_BYTES` | `10485760` | Max text file upload size in bytes (default 10 MB) |
+| `OMNIVOICE_CONVERSATION_WS_ENABLED` | `true` | Enable/disable the experimental `/ws/conversation` endpoint |
+| `OMNIVOICE_ASR_MODEL` | `small` | `faster-whisper` model name or local path for conversation ASR |
+| `OMNIVOICE_ASR_DEVICE` | `auto` | `faster-whisper` device selection: `auto`, `cpu`, `cuda`, `cuda:0`, etc. |
+| `OMNIVOICE_ASR_COMPUTE_TYPE` | `default` | `faster-whisper` compute type passed to the ASR model |
+| `OMNIVOICE_OLLAMA_HOST` | `http://localhost:11434` | Ollama server base URL used for conversation assistant requests |
+| `OMNIVOICE_OLLAMA_MODEL` | `gemma4` | Ollama model used to generate assistant text for `/ws/conversation` |
 
 ### Using a Pre-Downloaded Model
 

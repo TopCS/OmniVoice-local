@@ -54,6 +54,12 @@ Environment variables:
     OMNIVOICE_WS_MAX_SENTENCE_CHARS - WS max sentence length (default: 150)
     OMNIVOICE_WS_MIN_SENTENCE_CHARS - WS min sentence length (default: 20)
     OMNIVOICE_WS_BUFFER_TIMEOUT_MS - Flush text buffer timeout in streaming mode (default: 2000)
+    OMNIVOICE_CONVERSATION_WS_ENABLED - Enable /ws/conversation endpoint (default: true)
+    OMNIVOICE_ASR_MODEL      - faster-whisper model name or path (default: small)
+    OMNIVOICE_ASR_DEVICE     - faster-whisper device: auto, cpu, cuda, cuda:0, etc. (default: auto)
+    OMNIVOICE_ASR_COMPUTE_TYPE - faster-whisper compute type (default: default)
+    OMNIVOICE_OLLAMA_HOST    - Ollama API base URL (default: http://localhost:11434)
+    OMNIVOICE_OLLAMA_MODEL   - Ollama model for assistant replies (default: gemma4)
 """
 
 import hmac
@@ -65,20 +71,24 @@ import sys
 import threading
 import time
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torchaudio
 import uvicorn
+from audio_encoder import encode_audio_chunk
 from fastapi import Depends, FastAPI, Form, HTTPException, Security, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from ws_handler import WSConfig, create_ws_router
+from conversation_ws import create_conversation_router
+from sentence_splitter import SentenceSplitter
+from ws_handler import WSConfig, _generate_one, create_ws_router
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -99,9 +109,17 @@ SAMPLES_DIR = Path(os.environ.get("OMNIVOICE_SAMPLES_DIR", "/samples"))
 HOST = os.environ.get("OMNIVOICE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("OMNIVOICE_PORT", "8000"))
 DEFAULT_OUTPUT_FORMAT = os.environ.get("OMNIVOICE_OUTPUT_FORMAT", "wav")
-GRADIO_ENABLED = os.environ.get("OMNIVOICE_GRADIO_ENABLED", "true").lower() in ("true", "1", "yes")
+GRADIO_ENABLED = os.environ.get("OMNIVOICE_GRADIO_ENABLED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 GRADIO_PORT = int(os.environ.get("OMNIVOICE_GRADIO_PORT", "8001"))
-WYOMING_ENABLED = os.environ.get("OMNIVOICE_WYOMING_ENABLED", "false").lower() in ("true", "1", "yes")
+WYOMING_ENABLED = os.environ.get("OMNIVOICE_WYOMING_ENABLED", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 WYOMING_HOST = os.environ.get("OMNIVOICE_WYOMING_HOST", "0.0.0.0")
 WYOMING_PORT = int(os.environ.get("OMNIVOICE_WYOMING_PORT", "10200"))
 _OMNIVOICE_DEFAULT_LANGUAGES = (
@@ -111,15 +129,31 @@ _OMNIVOICE_DEFAULT_LANGUAGES = (
     "or,pa,pl,ps,pt,ro,ru,sa,sd,si,sk,sl,sn,so,sq,sr,su,sv,sw,ta,te,tg,"
     "th,tk,tl,tr,tt,uk,ur,uz,vi,yo,zh,zu"
 )
-WYOMING_LANGUAGES = os.environ.get("OMNIVOICE_WYOMING_LANGUAGES", _OMNIVOICE_DEFAULT_LANGUAGES)
+WYOMING_LANGUAGES = os.environ.get(
+    "OMNIVOICE_WYOMING_LANGUAGES", _OMNIVOICE_DEFAULT_LANGUAGES
+)
 API_KEY = os.environ.get("OMNIVOICE_API_KEY", "").strip()
 CORS_ORIGINS = os.environ.get("OMNIVOICE_CORS_ORIGINS", "").strip()
-MAX_UPLOAD_BYTES = int(os.environ.get("OMNIVOICE_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))  # 10 MB
-WS_ENABLED = os.environ.get("OMNIVOICE_WS_ENABLED", "true").lower() in ("true", "1", "yes")
+MAX_UPLOAD_BYTES = int(
+    os.environ.get("OMNIVOICE_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))
+)  # 10 MB
+WS_ENABLED = os.environ.get("OMNIVOICE_WS_ENABLED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 WS_DEFAULT_NUM_STEP = int(os.environ.get("OMNIVOICE_WS_DEFAULT_NUM_STEP", "16"))
 WS_MAX_SENTENCE_CHARS = int(os.environ.get("OMNIVOICE_WS_MAX_SENTENCE_CHARS", "150"))
 WS_MIN_SENTENCE_CHARS = int(os.environ.get("OMNIVOICE_WS_MIN_SENTENCE_CHARS", "20"))
 WS_BUFFER_TIMEOUT_MS = int(os.environ.get("OMNIVOICE_WS_BUFFER_TIMEOUT_MS", "2000"))
+CONVERSATION_WS_ENABLED = os.environ.get(
+    "OMNIVOICE_CONVERSATION_WS_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+ASR_MODEL = os.environ.get("OMNIVOICE_ASR_MODEL", "small")
+ASR_DEVICE = os.environ.get("OMNIVOICE_ASR_DEVICE", "auto")
+ASR_COMPUTE_TYPE = os.environ.get("OMNIVOICE_ASR_COMPUTE_TYPE", "default")
+OLLAMA_HOST = os.environ.get("OMNIVOICE_OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OMNIVOICE_OLLAMA_MODEL", "gemma4")
 
 DTYPE_MAP = {
     "float16": torch.float16,
@@ -140,17 +174,17 @@ MIME_TYPES = {
 # OpenAI response_format → internal format + MIME type
 # "opus" uses an Ogg container; "aac" falls back to mp3; "pcm" is raw s16le
 OPENAI_FORMAT_MAP = {
-    "mp3":  ("mp3",  "audio/mpeg"),
-    "opus": ("ogg",  "audio/ogg"),
-    "aac":  ("mp3",  "audio/mpeg"),   # best-effort fallback
+    "mp3": ("mp3", "audio/mpeg"),
+    "opus": ("ogg", "audio/ogg"),
+    "aac": ("mp3", "audio/mpeg"),  # best-effort fallback
     "flac": ("flac", "audio/flac"),
-    "wav":  ("wav",  "audio/wav"),
-    "pcm":  ("pcm",  "audio/pcm"),    # raw s16le, handled specially
+    "wav": ("wav", "audio/wav"),
+    "pcm": ("pcm", "audio/pcm"),  # raw s16le, handled specially
 }
 
 # OpenAI model → diffusion steps
 OPENAI_MODEL_STEPS = {
-    "tts-1":    16,
+    "tts-1": 16,
     "tts-1-hd": 32,
 }
 
@@ -179,6 +213,7 @@ async def require_api_key(
 # ---------------------------------------------------------------------------
 # Sample directory scanner
 # ---------------------------------------------------------------------------
+
 
 def scan_samples(directory: Path) -> dict:
     """
@@ -236,6 +271,7 @@ def scan_samples(directory: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
+
 
 class TTSRequest(BaseModel):
     """Request body for the /tts endpoint."""
@@ -364,6 +400,7 @@ class TTSRequest(BaseModel):
 
 class SampleInfo(BaseModel):
     """Info about a single voice sample."""
+
     name: str
     audio_file: str
     has_transcript: bool
@@ -375,6 +412,7 @@ class OpenAISpeechRequest(BaseModel):
     OpenAI-compatible /v1/audio/speech request body.
     See: https://platform.openai.com/docs/api-reference/audio/createSpeech
     """
+
     model: str = Field(
         ...,
         description="TTS model to use. 'tts-1' = fast (16 steps), 'tts-1-hd' = quality (32 steps).",
@@ -415,6 +453,200 @@ voice_samples: dict = {}
 wyoming_server = None
 model_lock: asyncio.Lock = asyncio.Lock()
 active_ws_connections = 0
+conversation_service = None
+
+
+class ConversationService:
+    """Server-side ASR + assistant TTS for `/ws/conversation`."""
+
+    def __init__(
+        self,
+        asr_adapter: Any,
+        *,
+        assistant_client: Any,
+        assistant_model: str,
+    ):
+        self._asr_adapter = asr_adapter
+        self._assistant_client = assistant_client
+        self._assistant_model = assistant_model
+        self._splitter = SentenceSplitter(
+            max_chars=WS_MAX_SENTENCE_CHARS,
+            min_chars=max(1, WS_MIN_SENTENCE_CHARS),
+        )
+        self._voice_prompt_cache: dict[tuple[str, str | None], Any] = {}
+
+    async def transcribe(self, audio_bytes: bytes, sample_rate: int) -> str:
+        if sample_rate != 16000:
+            raise RuntimeError(
+                "Conversation ASR currently expects mono 16 kHz PCM audio."
+            )
+        return await asyncio.to_thread(self._asr_adapter.transcribe, audio_bytes)
+
+    async def respond(
+        self, transcript: str, response_id: int, *, sample: str | None = None
+    ):
+        text = str(transcript).strip()
+        if not text:
+            yield {"type": "response_done", "response_id": response_id}
+            return
+
+        response_text = (await self._generate_assistant_text(text)).strip()
+        if not response_text:
+            yield {"type": "response_done", "response_id": response_id}
+            return
+
+        sentences = self._splitter.split_text(response_text)
+        if not sentences:
+            yield {"type": "response_done", "response_id": response_id}
+            return
+
+        voice_clone_prompt = None
+        if sample:
+            voice_clone_prompt = await self._get_voice_clone_prompt(sample)
+
+        last_sentence_index = len(sentences) - 1
+        for sentence_index, sentence in enumerate(sentences):
+            yield {
+                "type": "assistant_text",
+                "text": sentence,
+                "response_id": response_id,
+            }
+
+            gen_kwargs: dict[str, Any] = {
+                "text": sentence,
+                "num_step": WS_DEFAULT_NUM_STEP,
+            }
+            if voice_clone_prompt is not None:
+                gen_kwargs["voice_clone_prompt"] = voice_clone_prompt
+
+            started = time.monotonic()
+            audio = await self._generate_sentence_audio(gen_kwargs)
+            generation_ms = int((time.monotonic() - started) * 1000)
+            duration_ms = int(audio.shape[-1] * 1000 / SAMPLE_RATE)
+
+            yield {
+                "type": "audio_chunk",
+                "response_id": response_id,
+                "chunk_index": sentence_index,
+                "sentence": sentence,
+                "duration_ms": duration_ms,
+                "generation_time_ms": generation_ms,
+                "is_last": sentence_index == last_sentence_index,
+                "payload": encode_audio_chunk(
+                    audio, output_format="pcm", sample_rate=SAMPLE_RATE
+                ),
+            }
+
+        yield {"type": "response_done", "response_id": response_id}
+
+    def validate_sample(self, sample: str | None) -> None:
+        if sample and sample not in voice_samples:
+            raise RuntimeError(f"Sample '{sample}' not found.")
+
+    def clear_voice_prompt_cache(self) -> None:
+        self._voice_prompt_cache.clear()
+
+    async def _generate_sentence_audio(self, gen_kwargs: dict[str, Any]):
+        generation_task = asyncio.create_task(
+            _generate_one(lambda: model, model_lock, gen_kwargs)
+        )
+        try:
+            return await asyncio.shield(generation_task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await generation_task
+            raise
+
+    async def _get_voice_clone_prompt(self, sample: str) -> Any:
+        if sample not in voice_samples:
+            raise RuntimeError(f"Sample '{sample}' not found.")
+
+        sample_info = voice_samples[sample]
+        ref_text = sample_info.get("ref_text")
+        cache_key = (sample, ref_text)
+        cached_prompt = self._voice_prompt_cache.get(cache_key)
+        if cached_prompt is not None:
+            return cached_prompt
+
+        if model is None:
+            raise RuntimeError("Model not loaded yet.")
+
+        kwargs = {"ref_audio": sample_info["audio_path"]}
+        if ref_text is not None:
+            kwargs["ref_text"] = ref_text
+
+        async with model_lock:
+            prompt = await asyncio.to_thread(model.create_voice_clone_prompt, **kwargs)
+
+        self._voice_prompt_cache[cache_key] = prompt
+        return prompt
+
+    async def _generate_assistant_text(self, transcript: str) -> str:
+        response = await self._assistant_client.chat(
+            model=self._assistant_model,
+            messages=[{"role": "user", "content": transcript}],
+            stream=False,
+        )
+        return _extract_ollama_message_text(response)
+
+
+class _ConversationServiceProxy:
+    async def transcribe(self, audio_bytes: bytes, sample_rate: int) -> str:
+        return await _require_conversation_service().transcribe(
+            audio_bytes, sample_rate
+        )
+
+    def validate_sample(self, sample: str | None) -> None:
+        _require_conversation_service().validate_sample(sample)
+
+    async def respond(
+        self, transcript: str, response_id: int, *, sample: str | None = None
+    ):
+        async for event in _require_conversation_service().respond(
+            transcript, response_id, sample=sample
+        ):
+            yield event
+
+
+def _require_conversation_service() -> ConversationService:
+    if conversation_service is None:
+        raise RuntimeError("Conversation service not loaded yet.")
+    return conversation_service
+
+
+def _create_conversation_service() -> ConversationService:
+    from asr import FasterWhisperASR
+    from ollama import AsyncClient
+
+    return ConversationService(
+        FasterWhisperASR(
+            model_name=ASR_MODEL,
+            device=ASR_DEVICE,
+            compute_type=ASR_COMPUTE_TYPE,
+        ),
+        assistant_client=AsyncClient(host=OLLAMA_HOST),
+        assistant_model=OLLAMA_MODEL,
+    )
+
+
+conversation_service_proxy = _ConversationServiceProxy()
+
+
+def _extract_ollama_message_text(response: Any) -> str:
+    if isinstance(response, dict):
+        message = response.get("message")
+        if isinstance(message, dict):
+            return str(message.get("content") or "")
+        return ""
+
+    message = getattr(response, "message", None)
+    if message is None:
+        return ""
+
+    content = getattr(message, "content", None)
+    if content is None and hasattr(message, "get"):
+        content = message.get("content")
+    return str(content or "")
 
 
 def _inc_active_ws(delta: int) -> None:
@@ -426,22 +658,27 @@ def _inc_active_ws(delta: int) -> None:
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """Startup / shutdown lifecycle for the application."""
-    global model, voice_samples, wyoming_server
+    global model, voice_samples, wyoming_server, conversation_service
 
     dtype = DTYPE_MAP.get(DTYPE_STR)
     if dtype is None:
-        log.error("Invalid OMNIVOICE_DTYPE=%s. Use: float16, bfloat16, float32", DTYPE_STR)
+        log.error(
+            "Invalid OMNIVOICE_DTYPE=%s. Use: float16, bfloat16, float32", DTYPE_STR
+        )
         sys.exit(1)
 
     if API_KEY:
         log.info("API key authentication: ENABLED")
     else:
-        log.warning("API key authentication: DISABLED (set OMNIVOICE_API_KEY to enable)")
+        log.warning(
+            "API key authentication: DISABLED (set OMNIVOICE_API_KEY to enable)"
+        )
 
     log.info("Loading OmniVoice model: %s", MODEL_ID)
     log.info("  device=%s  dtype=%s", DEVICE, DTYPE_STR)
 
     from omnivoice import OmniVoice
+
     model = OmniVoice.from_pretrained(
         MODEL_ID,
         device_map=DEVICE,
@@ -451,6 +688,10 @@ async def lifespan(application: FastAPI):
 
     log.info("Scanning samples directory: %s", SAMPLES_DIR)
     voice_samples = scan_samples(SAMPLES_DIR)
+
+    if CONVERSATION_WS_ENABLED:
+        log.info("Loading ASR model: %s", ASR_MODEL)
+        conversation_service = _create_conversation_service()
 
     # Launch Gradio UI in a background thread, sharing the same model
     if GRADIO_ENABLED:
@@ -464,6 +705,7 @@ async def lifespan(application: FastAPI):
     if wyoming_server is not None:
         wyoming_server.stop()
         wyoming_server = None
+    conversation_service = None
 
     log.info("Shutting down OmniVoice server.")
 
@@ -497,6 +739,13 @@ app.include_router(
         active_counter=_inc_active_ws,
     )
 )
+if CONVERSATION_WS_ENABLED:
+    app.include_router(
+        create_conversation_router(
+            service=conversation_service_proxy,
+            active_counter=_inc_active_ws,
+        )
+    )
 
 # CORS middleware (enabled when OMNIVOICE_CORS_ORIGINS is set)
 if CORS_ORIGINS:
@@ -512,6 +761,7 @@ if CORS_ORIGINS:
 # ---------------------------------------------------------------------------
 # Gradio integration
 # ---------------------------------------------------------------------------
+
 
 def _launch_gradio():
     """
@@ -547,13 +797,16 @@ def _launch_gradio():
 # Wyoming protocol integration
 # ---------------------------------------------------------------------------
 
+
 class _WyomingServer:
     """Minimal Wyoming TCP server for Home Assistant integration."""
 
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self._thread = threading.Thread(target=self._run, name="wyoming-server", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="wyoming-server", daemon=True
+        )
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._server: Optional[asyncio.base_events.Server] = None
         self._ready = threading.Event()
@@ -586,13 +839,17 @@ class _WyomingServer:
             self._loop.close()
 
     async def _serve(self):
-        self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        self._server = await asyncio.start_server(
+            self._handle_client, self.host, self.port
+        )
         log.info("Wyoming TCP server listening on %s:%d", self.host, self.port)
         self._ready.set()
         async with self._server:
             await self._server.serve_forever()
 
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
         synth_state = {"voice": None, "chunks": []}
         synthesized = False  # track whether we already synthesized in this connection
         peer = writer.get_extra_info("peername")
@@ -626,7 +883,9 @@ class _WyomingServer:
                         synth_state["chunks"].append(chunk)
                 elif event_type == "synthesize-stop":
                     if synthesized:
-                        log.debug("Skipping duplicate streaming synthesize from %s", peer)
+                        log.debug(
+                            "Skipping duplicate streaming synthesize from %s", peer
+                        )
                     else:
                         text = "".join(synth_state["chunks"]).strip()
                         if text:
@@ -681,9 +940,7 @@ def _wyoming_info_event() -> dict:
 
     return {
         "type": "info",
-        "data": {
-            "tts": [tts_program]
-        },
+        "data": {"tts": [tts_program]},
     }
 
 
@@ -699,7 +956,12 @@ def _resolve_wyoming_languages() -> list[str]:
 
     # Common patterns from Whisper-like tokenizers
     if tokenizer is not None:
-        for attr in ("_LANGUAGE_CODES", "LANGUAGE_CODES", "language_codes", "languages"):
+        for attr in (
+            "_LANGUAGE_CODES",
+            "LANGUAGE_CODES",
+            "language_codes",
+            "languages",
+        ):
             value = getattr(tokenizer, attr, None)
             if isinstance(value, (list, tuple, set)):
                 discovered = [str(code).strip() for code in value if str(code).strip()]
@@ -713,9 +975,14 @@ def _resolve_wyoming_languages() -> list[str]:
             try:
                 value = get_languages()
                 if isinstance(value, (list, tuple, set)):
-                    discovered = [str(code).strip() for code in value if str(code).strip()]
+                    discovered = [
+                        str(code).strip() for code in value if str(code).strip()
+                    ]
             except Exception as exc:
-                log.debug("Failed to get languages from model.get_supported_languages: %s", exc)
+                log.debug(
+                    "Failed to get languages from model.get_supported_languages: %s",
+                    exc,
+                )
 
     if discovered:
         return sorted(set(discovered))
@@ -726,7 +993,9 @@ def _resolve_wyoming_languages() -> list[str]:
     return sorted(set(fallback))
 
 
-async def _wyoming_send_tts(writer: asyncio.StreamWriter, text: str, voice: Optional[dict]):
+async def _wyoming_send_tts(
+    writer: asyncio.StreamWriter, text: str, voice: Optional[dict]
+):
     sample = None
     if isinstance(voice, dict):
         candidate = voice.get("name") or voice.get("speaker")
@@ -734,7 +1003,9 @@ async def _wyoming_send_tts(writer: asyncio.StreamWriter, text: str, voice: Opti
             sample = candidate
 
     try:
-        gen_kwargs = _build_gen_kwargs(text=text, sample=sample if sample in voice_samples else None)
+        gen_kwargs = _build_gen_kwargs(
+            text=text, sample=sample if sample in voice_samples else None
+        )
         audio, elapsed = await _run_model_async(gen_kwargs)
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
@@ -750,7 +1021,10 @@ async def _wyoming_send_tts(writer: asyncio.StreamWriter, text: str, voice: Opti
 
     await _wyoming_send_event(
         writer,
-        {"type": "audio-start", "data": {"rate": SAMPLE_RATE, "width": 2, "channels": 1}},
+        {
+            "type": "audio-start",
+            "data": {"rate": SAMPLE_RATE, "width": 2, "channels": 1},
+        },
     )
     chunk_size = 8192
     for i in range(0, len(pcm), chunk_size):
@@ -759,7 +1033,7 @@ async def _wyoming_send_tts(writer: asyncio.StreamWriter, text: str, voice: Opti
             {
                 "type": "audio-chunk",
                 "data": {"rate": SAMPLE_RATE, "width": 2, "channels": 1},
-                "payload": pcm[i:i + chunk_size],
+                "payload": pcm[i : i + chunk_size],
             },
         )
     await _wyoming_send_event(writer, {"type": "audio-stop"})
@@ -807,6 +1081,7 @@ async def _wyoming_read_event(reader: asyncio.StreamReader) -> Optional[dict]:
 # API endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.get("/health", tags=["System"])
 async def health():
     """Health check. Returns 503 while the model is still loading."""
@@ -822,6 +1097,7 @@ async def health():
             "gradio_enabled": GRADIO_ENABLED,
             "gradio_port": GRADIO_PORT if GRADIO_ENABLED else None,
             "websocket_enabled": WS_ENABLED,
+            "conversation_websocket_enabled": CONVERSATION_WS_ENABLED,
             "active_ws_connections": active_ws_connections,
         },
     )
@@ -834,13 +1110,17 @@ async def list_samples(_: None = Depends(require_api_key)):
     for name, info in sorted(voice_samples.items()):
         preview = None
         if info["ref_text"]:
-            preview = info["ref_text"][:120] + ("..." if len(info["ref_text"]) > 120 else "")
-        result.append(SampleInfo(
-            name=name,
-            audio_file=Path(info["audio_path"]).name,
-            has_transcript=info["ref_text"] is not None,
-            transcript_preview=preview,
-        ))
+            preview = info["ref_text"][:120] + (
+                "..." if len(info["ref_text"]) > 120 else ""
+            )
+        result.append(
+            SampleInfo(
+                name=name,
+                audio_file=Path(info["audio_path"]).name,
+                has_transcript=info["ref_text"] is not None,
+                transcript_preview=preview,
+            )
+        )
     return result
 
 
@@ -849,12 +1129,15 @@ async def reload_samples(_: None = Depends(require_api_key)):
     """Re-scan the samples directory (e.g. after adding new files)."""
     global voice_samples
     voice_samples = scan_samples(SAMPLES_DIR)
+    if conversation_service is not None:
+        conversation_service.clear_voice_prompt_cache()
     return {"status": "ok", "count": len(voice_samples)}
 
 
 # ---------------------------------------------------------------------------
 # Shared generation logic
 # ---------------------------------------------------------------------------
+
 
 def _build_gen_kwargs(
     text: str,
@@ -893,7 +1176,9 @@ def _build_gen_kwargs(
         gen_kwargs["ref_audio"] = sample_info["audio_path"]
 
         # ref_text priority: request body > .txt file > None (auto-transcribe)
-        resolved_ref_text = ref_text if ref_text is not None else sample_info["ref_text"]
+        resolved_ref_text = (
+            ref_text if ref_text is not None else sample_info["ref_text"]
+        )
         if resolved_ref_text is not None:
             gen_kwargs["ref_text"] = resolved_ref_text
 
@@ -985,7 +1270,9 @@ def _encode_audio(audio: torch.Tensor, fmt: str, mime_type: str) -> tuple[bytes,
     return buf.read(), mime_type
 
 
-def _audio_response(audio: torch.Tensor, elapsed: float, fmt: str, mime_type: str, log_tag: str = "") -> Response:
+def _audio_response(
+    audio: torch.Tensor, elapsed: float, fmt: str, mime_type: str, log_tag: str = ""
+) -> Response:
     """Build a Response from an audio tensor with timing headers."""
     content, actual_mime = _encode_audio(audio, fmt, mime_type)
     duration_s = audio.shape[-1] / SAMPLE_RATE
@@ -994,7 +1281,10 @@ def _audio_response(audio: torch.Tensor, elapsed: float, fmt: str, mime_type: st
     log.info(
         "%sGenerated %.2fs audio in %.2fs (RTF=%.3f) format=%s",
         f"[{log_tag}] " if log_tag else "",
-        duration_s, elapsed, rtf, fmt,
+        duration_s,
+        elapsed,
+        rtf,
+        fmt,
     )
 
     return Response(
@@ -1008,7 +1298,9 @@ def _audio_response(audio: torch.Tensor, elapsed: float, fmt: str, mime_type: st
     )
 
 
-async def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample_name: Optional[str]) -> Response:
+async def _generate_audio(
+    gen_kwargs: dict, output_format: Optional[str], sample_name: Optional[str]
+) -> Response:
     """Run model.generate() and return audio Response."""
     fmt = (output_format or DEFAULT_OUTPUT_FORMAT).lower()
     if fmt not in MIME_TYPES:
@@ -1018,12 +1310,15 @@ async def _generate_audio(gen_kwargs: dict, output_format: Optional[str], sample
         )
 
     audio, elapsed = await _run_model_async(gen_kwargs)
-    return _audio_response(audio, elapsed, fmt, MIME_TYPES[fmt], log_tag=sample_name or "")
+    return _audio_response(
+        audio, elapsed, fmt, MIME_TYPES[fmt], log_tag=sample_name or ""
+    )
 
 
 # ---------------------------------------------------------------------------
 # TTS endpoints
 # ---------------------------------------------------------------------------
+
 
 @app.post("/tts", tags=["TTS"])
 async def synthesize(req: TTSRequest, _: None = Depends(require_api_key)):
@@ -1063,24 +1358,56 @@ async def synthesize(req: TTSRequest, _: None = Depends(require_api_key)):
 @app.post("/tts/file", tags=["TTS"])
 async def synthesize_from_file(
     _: None = Depends(require_api_key),
-    text_file: UploadFile = File(..., description="Text file (.txt) with content to synthesize."),
+    text_file: UploadFile = File(
+        ..., description="Text file (.txt) with content to synthesize."
+    ),
     sample: Optional[str] = Form(None, description="Voice sample name for cloning."),
-    instruct: Optional[str] = Form(None, description="Speaker attributes for voice design."),
-    ref_text: Optional[str] = Form(None, description="Override transcript for the sample."),
+    instruct: Optional[str] = Form(
+        None, description="Speaker attributes for voice design."
+    ),
+    ref_text: Optional[str] = Form(
+        None, description="Override transcript for the sample."
+    ),
     num_step: Optional[int] = Form(None, description="Diffusion steps (default: 32)."),
-    guidance_scale: Optional[float] = Form(None, description="CFG scale (default: 2.0)."),
-    t_shift: Optional[float] = Form(None, description="Time-step shift (default: 0.1)."),
-    denoise: Optional[bool] = Form(None, description="Prepend denoising token (default: true)."),
-    position_temperature: Optional[float] = Form(None, description="Mask-position temperature (default: 5.0)."),
-    class_temperature: Optional[float] = Form(None, description="Token sampling temperature (default: 0.0)."),
-    layer_penalty_factor: Optional[float] = Form(None, description="Codebook layer penalty (default: 5.0)."),
-    duration: Optional[float] = Form(None, description="Fixed output duration in seconds."),
-    speed: Optional[float] = Form(None, description="Speed factor (>1 faster, <1 slower)."),
-    preprocess_prompt: Optional[bool] = Form(None, description="Preprocess reference audio (default: true)."),
-    postprocess_output: Optional[bool] = Form(None, description="Post-process output (default: true)."),
-    audio_chunk_duration: Optional[float] = Form(None, description="Chunk duration for long text (default: 15.0)."),
-    audio_chunk_threshold: Optional[float] = Form(None, description="Chunking activation threshold (default: 30.0)."),
-    output_format: Optional[str] = Form(None, description="Output format: wav, mp3, flac, ogg."),
+    guidance_scale: Optional[float] = Form(
+        None, description="CFG scale (default: 2.0)."
+    ),
+    t_shift: Optional[float] = Form(
+        None, description="Time-step shift (default: 0.1)."
+    ),
+    denoise: Optional[bool] = Form(
+        None, description="Prepend denoising token (default: true)."
+    ),
+    position_temperature: Optional[float] = Form(
+        None, description="Mask-position temperature (default: 5.0)."
+    ),
+    class_temperature: Optional[float] = Form(
+        None, description="Token sampling temperature (default: 0.0)."
+    ),
+    layer_penalty_factor: Optional[float] = Form(
+        None, description="Codebook layer penalty (default: 5.0)."
+    ),
+    duration: Optional[float] = Form(
+        None, description="Fixed output duration in seconds."
+    ),
+    speed: Optional[float] = Form(
+        None, description="Speed factor (>1 faster, <1 slower)."
+    ),
+    preprocess_prompt: Optional[bool] = Form(
+        None, description="Preprocess reference audio (default: true)."
+    ),
+    postprocess_output: Optional[bool] = Form(
+        None, description="Post-process output (default: true)."
+    ),
+    audio_chunk_duration: Optional[float] = Form(
+        None, description="Chunk duration for long text (default: 15.0)."
+    ),
+    audio_chunk_threshold: Optional[float] = Form(
+        None, description="Chunking activation threshold (default: 30.0)."
+    ),
+    output_format: Optional[str] = Form(
+        None, description="Output format: wav, mp3, flac, ogg."
+    ),
 ):
     """
     Synthesize speech from a text file (multipart/form-data).
@@ -1101,7 +1428,9 @@ async def synthesize_from_file(
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="Text file must be UTF-8 encoded.") from None
+        raise HTTPException(
+            status_code=400, detail="Text file must be UTF-8 encoded."
+        ) from None
 
     if not text:
         raise HTTPException(status_code=400, detail="Text file is empty.")
@@ -1132,11 +1461,21 @@ async def synthesize_from_file(
 # OpenAI-compatible endpoints  (/v1/audio/speech)
 # ---------------------------------------------------------------------------
 
-def _openai_error(status_code: int, message: str, error_type: str = "invalid_request_error") -> JSONResponse:
+
+def _openai_error(
+    status_code: int, message: str, error_type: str = "invalid_request_error"
+) -> JSONResponse:
     """Return an error response in the OpenAI error envelope format."""
     return JSONResponse(
         status_code=status_code,
-        content={"error": {"message": message, "type": error_type, "param": None, "code": None}},
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": None,
+                "code": None,
+            }
+        },
     )
 
 
@@ -1195,12 +1534,22 @@ async def openai_speech(req: OpenAISpeechRequest, _: None = Depends(require_api_
         )
         audio, elapsed = await _run_model_async(gen_kwargs)
     except HTTPException as exc:
-        return _openai_error(exc.status_code, exc.detail if isinstance(exc.detail, str) else str(exc.detail), error_type="server_error")
+        return _openai_error(
+            exc.status_code,
+            exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+            error_type="server_error",
+        )
     except Exception as exc:
         log.exception("OpenAI endpoint: unexpected generation error")
         return _openai_error(500, f"Generation error: {exc}", error_type="server_error")
 
-    return _audio_response(audio, elapsed, internal_fmt, mime_type, log_tag=f"openai voice={req.voice} model={req.model}")
+    return _audio_response(
+        audio,
+        elapsed,
+        internal_fmt,
+        mime_type,
+        log_tag=f"openai voice={req.voice} model={req.model}",
+    )
 
 
 @app.get("/v1/models", tags=["OpenAI-compatible"])
@@ -1212,7 +1561,7 @@ async def openai_list_models(_: None = Depends(require_api_key)):
     """
     now = int(time.time())
     models = [
-        {"id": "tts-1",    "object": "model", "created": now, "owned_by": "omnivoice"},
+        {"id": "tts-1", "object": "model", "created": now, "owned_by": "omnivoice"},
         {"id": "tts-1-hd", "object": "model", "created": now, "owned_by": "omnivoice"},
     ]
     return {"object": "list", "data": models}
