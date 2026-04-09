@@ -100,59 +100,99 @@ Supported events:
 
 Endpoint: `ws://localhost:8000/ws/tts`
 
+Current auth behavior: `/ws/tts` does not enforce `OMNIVOICE_API_KEY`. REST and OpenAI-style HTTP endpoints can be protected with bearer-token auth when `OMNIVOICE_API_KEY` is set, but the current WebSocket implementation accepts direct connections without WebSocket authentication headers or tokens.
+
 Supported inbound messages:
 
 - `{"type":"synthesize","text":"...","sample":"optional","instruct":"optional","output_format":"pcm|wav","num_step":16,"speed":1.0}`
 - `{"type":"text_chunk","text":"..."}` (incremental LLM token stream mode)
 - `{"type":"text_flush"}` (force synthesis of buffered text)
-- `{"type":"set_voice","sample":"my-voice","ref_text":"optional override"}`
+- `{"type":"set_voice","sample":"my-voice","ref_text":"optional override"}`. If the sample is unknown, the server currently sends an `error` event and closes the connection.
 
 Server outbound messages:
 
 - `audio_chunk` JSON metadata message followed by a binary audio message (`pcm` or `wav`) for each synthesized sentence.
-- `done` once the current synthesis operation is complete.
+- `voice_set` acknowledgment after a successful `set_voice` request, for example `{"type":"voice_set","sample":"my-voice"}`.
+- `done` once the current operation completes. Its numeric totals (`total_chunks`, `total_duration_ms`, `total_generation_time_ms`) are cumulative for the current WebSocket session, not just the most recent operation.
 - `error` for invalid messages / unknown samples.
 
 Voice clone prompts are cached per WebSocket session and reused for each chunk until `set_voice` is called again.
 
-### Quick `websocat` example
+### Remote playback client
+
+The real playback workflow lives in `examples/ws_playback_client.py`. It is meant to run on the machine that has the speakers or headphones attached, while the OmniVoice server can run on another host.
+
+Because `/ws/tts` is currently unauthenticated, the example connects directly to the WebSocket URL and does not send an API key.
+
+The playback client depends on `websockets` and `pyaudio`:
+
+```bash
+python -m pip install websockets pyaudio
+```
+
+Debian/Ubuntu: if `pyaudio` wheels are unavailable, install PortAudio headers first with `sudo apt install portaudio19-dev python3-pyaudio` and retry the pip install in your environment.
+
+macOS: install PortAudio first with `brew install portaudio`, then run `python -m pip install pyaudio websockets`.
+
+Live playback only supports `pcm`. The example client rejects any other `--output-format` because it writes raw 24 kHz mono PCM frames directly to the local audio device.
+
+```bash
+python examples/ws_playback_client.py \
+  --url ws://server-host:8000/ws/tts \
+  --text "Hello from the remote playback client." \
+  --sample your-sample-name \
+  --output-format pcm
+```
+
+The client prints each `audio_chunk` / `done` event as JSON and plays the matching binary PCM frames through the local speakers.
+
+### Manual real-stack smoke test
+
+This is a manual integration check that complements the pytest coverage.
+
+Prerequisites:
+
+- Docker Compose installed
+- Enough time for the initial model download and startup warmup
+- NVIDIA GPU access with a working CUDA container runtime if you use the stock `compose.yaml`; edit the compose file first if you need a CPU-only or non-NVIDIA deployment
+- At least one valid sample available in `./samples`
+- `websocat` installed on the machine running the test
+
+Start the stack:
+
+```bash
+docker compose up -d --build
+```
+
+Then poll readiness until the model finishes loading. A single early `curl` may fail or report that startup is still in progress while weights download and the model initializes:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Repeat that check until `/health` reports ready, then open a WebSocket session:
 
 ```bash
 websocat ws://localhost:8000/ws/tts
-{"type":"synthesize","text":"Ciao! Come posso aiutarti oggi?","sample":"agent-voice","output_format":"pcm"}
 ```
 
-### Minimal Python client example
+Then send a synthesize request that references a real sample from `./samples`:
 
-```python
-import asyncio
-import json
-import websockets
-
-async def main():
-    async with websockets.connect("ws://localhost:8000/ws/tts") as ws:
-        await ws.send(json.dumps({
-            "type": "synthesize",
-            "text": "Hello! This is sentence streaming.",
-            "output_format": "pcm",
-            "num_step": 16
-        }))
-        while True:
-            message = await ws.recv()
-            if isinstance(message, bytes):
-                print("audio bytes:", len(message))
-                continue
-            event = json.loads(message)
-            print(event)
-            if event.get("type") == "done":
-                break
-
-asyncio.run(main())
+```json
+{"type":"synthesize","text":"Ciao! Come posso aiutarti oggi?","sample":"your-sample-name","output_format":"pcm","num_step":16}
 ```
+
+Expected result:
+
+- One or more `audio_chunk` JSON events appear first
+- Each `audio_chunk` event is followed by a binary payload in the terminal output
+- A final `done` event arrives after the last chunk
+
+If you want local speaker playback instead of inspecting the raw binary frames in the terminal, run `examples/ws_playback_client.py` from the playback machine against the same `ws://.../ws/tts` endpoint.
 
 ### `GET /health`
 
-Health check. Returns model status, device info, and Gradio state.
+Health check. Returns model status, device info, and Gradio state. It returns HTTP `503` while the model is still loading and HTTP `200` once the server is ready to accept synthesis requests.
 
 ### `GET /samples`
 
@@ -494,7 +534,7 @@ HTTP 500
 
 API key authentication is **optional**. When disabled (default), all endpoints are open.
 
-To enable it, set the `OMNIVOICE_API_KEY` environment variable to any non-empty string. Once set, every request to the API (except `GET /health`) must include:
+To enable it, set the `OMNIVOICE_API_KEY` environment variable to any non-empty string. Once set, authenticated HTTP API routes require:
 
 ```
 Authorization: Bearer <your-key>
@@ -510,7 +550,7 @@ curl -X POST http://localhost:8000/tts \
   -o output.wav
 ```
 
-`GET /health` is always open so Docker/Podman healthchecks continue to work without credentials.
+`GET /health` is always open so Docker/Podman healthchecks continue to work without credentials. The current `/ws/tts` WebSocket endpoint is also unauthenticated and does not enforce `OMNIVOICE_API_KEY`.
 
 **Setup:**
 

@@ -38,7 +38,7 @@ class FakeTensor:
 
 
 def _tensor(values):
-    if torch is not None:
+    if hasattr(torch, "tensor") and hasattr(torch, "float32"):
         return torch.tensor(values, dtype=torch.float32)
     return FakeTensor(values)
 

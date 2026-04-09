@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from audio_encoder import encode_audio_chunk
 from sentence_splitter import SentenceSplitter
@@ -63,7 +64,9 @@ def create_ws_router(
             await websocket.close(code=1008)
             return
 
-        splitter = SentenceSplitter(max_chars=config.max_sentence_chars, min_chars=config.min_sentence_chars)
+        splitter = SentenceSplitter(
+            max_chars=config.max_sentence_chars, min_chars=config.min_sentence_chars
+        )
         state = WSSessionState()
         active_counter(1)
         log.info("WS connected from %s", websocket.client)
@@ -75,7 +78,11 @@ def create_ws_router(
                     if state.text_buffer
                     else float(config.inactivity_timeout_s)
                 )
-                msg = await _recv_json(websocket, timeout_s=timeout_s, idle_timeout_s=config.inactivity_timeout_s)
+                msg = await _recv_json(
+                    websocket,
+                    timeout_s=timeout_s,
+                    idle_timeout_s=config.inactivity_timeout_s,
+                )
                 if msg is None:
                     break
                 if msg.get("type") == "__buffer_timeout__":
@@ -92,7 +99,16 @@ def create_ws_router(
                             config,
                         )
                     continue
-                await _handle_message(websocket, msg, state, splitter, get_model, get_voice_samples, model_lock, config)
+                await _handle_message(
+                    websocket,
+                    msg,
+                    state,
+                    splitter,
+                    get_model,
+                    get_voice_samples,
+                    model_lock,
+                    config,
+                )
         except WebSocketDisconnect:
             log.info("WS disconnected by client %s", websocket.client)
         except Exception as exc:  # noqa: BLE001
@@ -109,7 +125,8 @@ def create_ws_router(
                 state.total_generation_time_ms,
                 elapsed,
             )
-            await websocket.close()
+            if websocket.application_state != WebSocketState.DISCONNECTED:
+                await websocket.close()
 
     return router
 
@@ -128,40 +145,71 @@ async def _handle_message(
     if msg_type == "synthesize":
         text = str(message.get("text", "")).strip()
         if not text:
-            await _send_error(websocket, "Field 'text' must not be empty.", "INVALID_TEXT")
+            await _send_error(
+                websocket, "Field 'text' must not be empty.", "INVALID_TEXT"
+            )
             return
-        await _ensure_voice_prompt(message, state, get_model, get_voice_samples, model_lock)
+        await _ensure_voice_prompt(
+            message, state, get_model, get_voice_samples, model_lock
+        )
         sentences = splitter.split_text(text)
-        await _synthesize_sentences(websocket, sentences, message, state, get_model, model_lock, config)
-        await _send_done(websocket, state)
+        synthesized = await _synthesize_sentences(
+            websocket, sentences, message, state, get_model, model_lock, config
+        )
+        if synthesized:
+            await _send_done(websocket, state)
         return
 
     if msg_type == "text_chunk":
         chunk = str(message.get("text", ""))
         if not chunk:
             return
-        await _ensure_voice_prompt(message, state, get_model, get_voice_samples, model_lock)
+        await _ensure_voice_prompt(
+            message, state, get_model, get_voice_samples, model_lock
+        )
         state.text_buffer += chunk
         complete, remainder = splitter.extract_complete_sentences(state.text_buffer)
         state.text_buffer = remainder
         if complete:
-            await _synthesize_sentences(websocket, splitter._post_process(complete), message, state, get_model, model_lock, config)
+            await _synthesize_sentences(
+                websocket,
+                splitter._post_process(complete),
+                message,
+                state,
+                get_model,
+                model_lock,
+                config,
+            )
         return
 
     if msg_type == "text_flush":
         pending = state.text_buffer.strip()
         state.text_buffer = ""
+        synthesized = False
         if pending:
-            await _synthesize_sentences(websocket, splitter.split_text(pending), message, state, get_model, model_lock, config)
-        await _send_done(websocket, state)
+            synthesized = await _synthesize_sentences(
+                websocket,
+                splitter.split_text(pending),
+                message,
+                state,
+                get_model,
+                model_lock,
+                config,
+            )
+        if not pending or synthesized:
+            await _send_done(websocket, state)
         return
 
     if msg_type == "set_voice":
-        await _ensure_voice_prompt(message, state, get_model, get_voice_samples, model_lock, force=True)
+        await _ensure_voice_prompt(
+            message, state, get_model, get_voice_samples, model_lock, force=True
+        )
         await websocket.send_json({"type": "voice_set", "sample": state.prompt_sample})
         return
 
-    await _send_error(websocket, f"Unsupported message type '{msg_type}'.", "INVALID_MESSAGE")
+    await _send_error(
+        websocket, f"Unsupported message type '{msg_type}'.", "INVALID_MESSAGE"
+    )
 
 
 async def _synthesize_sentences(
@@ -172,13 +220,18 @@ async def _synthesize_sentences(
     get_model: Callable[[], Any],
     model_lock: asyncio.Lock,
     config: WSConfig,
-) -> None:
+) -> bool:
     output_format = str(message.get("output_format") or "pcm").lower()
     if output_format not in {"pcm", "wav"}:
-        await _send_error(websocket, f"Unsupported output_format '{output_format}'.", "UNSUPPORTED_FORMAT")
-        return
+        await _send_error(
+            websocket,
+            f"Unsupported output_format '{output_format}'.",
+            "UNSUPPORTED_FORMAT",
+        )
+        return False
 
-    for sentence in sentences:
+    last_sentence_index = len(sentences) - 1
+    for sentence_index, sentence in enumerate(sentences):
         gen_kwargs = {
             "text": sentence,
             "num_step": int(message.get("num_step") or config.default_num_step),
@@ -195,8 +248,10 @@ async def _synthesize_sentences(
         generation_ms = int((time.monotonic() - started) * 1000)
         duration_ms = int(audio.shape[-1] * 1000 / config.sample_rate)
 
-        payload = encode_audio_chunk(audio, output_format=output_format, sample_rate=config.sample_rate)
-        is_last = sentence == sentences[-1]
+        payload = encode_audio_chunk(
+            audio, output_format=output_format, sample_rate=config.sample_rate
+        )
+        is_last = sentence_index == last_sentence_index
         await websocket.send_json(
             {
                 "type": "audio_chunk",
@@ -213,8 +268,12 @@ async def _synthesize_sentences(
         state.total_duration_ms += duration_ms
         state.total_generation_time_ms += generation_ms
 
+    return True
 
-async def _generate_one(get_model: Callable[[], Any], model_lock: asyncio.Lock, gen_kwargs: dict[str, Any]):
+
+async def _generate_one(
+    get_model: Callable[[], Any], model_lock: asyncio.Lock, gen_kwargs: dict[str, Any]
+):
     model = get_model()
     if model is None:
         raise RuntimeError("Model not loaded yet.")
@@ -241,7 +300,11 @@ async def _ensure_voice_prompt(
         return
 
     sample_name = str(sample)
-    if not force and state.prompt_sample == sample_name and state.voice_clone_prompt is not None:
+    if (
+        not force
+        and state.prompt_sample == sample_name
+        and state.voice_clone_prompt is not None
+    ):
         return
 
     samples = get_voice_samples()
@@ -249,7 +312,11 @@ async def _ensure_voice_prompt(
         raise RuntimeError(f"Sample '{sample_name}' not found.")
 
     sample_info = samples[sample_name]
-    ref_text = message.get("ref_text") if message.get("ref_text") is not None else sample_info.get("ref_text")
+    ref_text = (
+        message.get("ref_text")
+        if message.get("ref_text") is not None
+        else sample_info.get("ref_text")
+    )
 
     model = get_model()
     if model is None:
@@ -260,18 +327,28 @@ async def _ensure_voice_prompt(
         kwargs["ref_text"] = ref_text
 
     async with model_lock:
-        state.voice_clone_prompt = await asyncio.to_thread(model.create_voice_clone_prompt, **kwargs)
+        state.voice_clone_prompt = await asyncio.to_thread(
+            model.create_voice_clone_prompt, **kwargs
+        )
     state.prompt_sample = sample_name
     state.prompt_text = ref_text
 
 
-async def _recv_json(websocket: WebSocket, timeout_s: float, idle_timeout_s: int) -> Optional[dict[str, Any]]:
+async def _recv_json(
+    websocket: WebSocket, timeout_s: float, idle_timeout_s: int
+) -> Optional[dict[str, Any]]:
     try:
         payload = await asyncio.wait_for(websocket.receive_json(), timeout=timeout_s)
     except asyncio.TimeoutError:
         if timeout_s < idle_timeout_s:
             return {"type": "__buffer_timeout__"}
-        await websocket.send_json({"type": "error", "message": "Connection idle timeout.", "code": "IDLE_TIMEOUT"})
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "Connection idle timeout.",
+                "code": "IDLE_TIMEOUT",
+            }
+        )
         await websocket.close(code=1001)
         return None
     return payload if isinstance(payload, dict) else {"type": None}

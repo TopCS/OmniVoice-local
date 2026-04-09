@@ -4,6 +4,8 @@ import types
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
+from starlette.websockets import WebSocketDisconnect
 
 try:
     import torch  # type: ignore
@@ -39,7 +41,9 @@ class FakeModel:
 
 
 def _make_client(config: WSConfig | None = None):
-    ws_handler.encode_audio_chunk = lambda audio, output_format, sample_rate=24000: b"x" * 4800
+    ws_handler.encode_audio_chunk = lambda audio, output_format, sample_rate=24000: (
+        b"x" * 4800
+    )
     model = FakeModel()
     app = FastAPI()
     app.include_router(
@@ -57,7 +61,9 @@ def _make_client(config: WSConfig | None = None):
 
 
 def test_ws_synthesize_sends_metadata_then_binary_for_each_chunk():
-    client, model = _make_client(WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50))
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
 
     with client.websocket_connect("/ws/tts") as ws:
         ws.send_json(
@@ -98,8 +104,36 @@ def test_ws_synthesize_sends_metadata_then_binary_for_each_chunk():
     assert all(call["num_step"] == 16 for call in model.generate_calls)
 
 
+def test_ws_synthesize_duplicate_sentence_text_marks_only_final_chunk_as_last():
+    client, _model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "type": "synthesize",
+                "text": "Echo. Echo.",
+                "output_format": "pcm",
+            }
+        )
+
+        meta1 = ws.receive_json()
+        ws.receive_bytes()
+        meta2 = ws.receive_json()
+        ws.receive_bytes()
+        ws.receive_json()
+
+    assert meta1["sentence"] == "Echo."
+    assert meta1["is_last"] is False
+    assert meta2["sentence"] == "Echo."
+    assert meta2["is_last"] is True
+
+
 def test_ws_text_chunk_and_flush_streaming_mode():
-    client, model = _make_client(WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50))
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
 
     with client.websocket_connect("/ws/tts") as ws:
         ws.send_json({"type": "text_chunk", "text": "Hello."})
@@ -126,7 +160,9 @@ def test_ws_text_chunk_and_flush_streaming_mode():
 
 
 def test_ws_set_voice_caches_prompt_for_following_chunks():
-    client, model = _make_client(WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50))
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
 
     with client.websocket_connect("/ws/tts") as ws:
         ws.send_json({"type": "set_voice", "sample": "agent-voice"})
@@ -145,3 +181,132 @@ def test_ws_set_voice_caches_prompt_for_following_chunks():
     assert len(model.prompt_calls) == 1
     assert len(model.generate_calls) == 1
     assert model.generate_calls[0]["voice_clone_prompt"]["cached"] is True
+
+
+def test_ws_set_voice_missing_sample_sends_session_error_then_closes():
+    client, _model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"type": "set_voice", "sample": "missing-sample"})
+
+        assert ws.receive_json() == {
+            "type": "error",
+            "message": "Sample 'missing-sample' not found.",
+            "code": "SESSION_ERROR",
+        }
+
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_ws_synthesize_invalid_output_format_returns_error_without_done():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "type": "synthesize",
+                "text": "Ciao!",
+                "output_format": "mp3",
+            }
+        )
+
+        assert ws.receive_json() == {
+            "type": "error",
+            "message": "Unsupported output_format 'mp3'.",
+            "code": "UNSUPPORTED_FORMAT",
+        }
+
+        assert model.generate_calls == []
+
+        ws.send_json(
+            {
+                "type": "synthesize",
+                "text": "Ciao!",
+                "output_format": "pcm",
+            }
+        )
+
+        meta = ws.receive_json()
+        audio = ws.receive_bytes()
+        done = ws.receive_json()
+
+    assert meta["type"] == "audio_chunk"
+    assert meta["sentence"] == "Ciao!"
+    assert isinstance(audio, bytes) and len(audio) == 4800
+    assert done["type"] == "done"
+    assert len(model.generate_calls) == 1
+
+
+def test_ws_idle_timeout_sends_error_then_closes_socket():
+    client, _model = _make_client(
+        WSConfig(
+            min_sentence_chars=1,
+            max_sentence_chars=150,
+            buffer_timeout_ms=50,
+            inactivity_timeout_s=0.1,
+        )
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        assert ws.receive_json() == {
+            "type": "error",
+            "message": "Connection idle timeout.",
+            "code": "IDLE_TIMEOUT",
+        }
+
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_ws_text_flush_invalid_output_format_returns_error_without_done():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"type": "text_chunk", "text": "Ciao"})
+        ws.send_json({"type": "text_flush", "output_format": "mp3"})
+
+        assert ws.receive_json() == {
+            "type": "error",
+            "message": "Unsupported output_format 'mp3'.",
+            "code": "UNSUPPORTED_FORMAT",
+        }
+
+        assert model.generate_calls == []
+
+        ws.send_json({"type": "text_chunk", "text": "Hello"})
+        ws.send_json({"type": "text_flush", "output_format": "pcm"})
+
+        meta = ws.receive_json()
+        audio = ws.receive_bytes()
+        done = ws.receive_json()
+
+    assert meta["type"] == "audio_chunk"
+    assert meta["sentence"] == "Hello"
+    assert isinstance(audio, bytes) and len(audio) == 4800
+    assert done["type"] == "done"
+    assert len(model.generate_calls) == 1
+
+
+def test_ws_text_flush_empty_buffer_still_emits_done():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"type": "text_flush"})
+        done = ws.receive_json()
+
+    assert done == {
+        "type": "done",
+        "total_chunks": 0,
+        "total_duration_ms": 0,
+        "total_generation_time_ms": 0,
+    }
+    assert model.generate_calls == []
