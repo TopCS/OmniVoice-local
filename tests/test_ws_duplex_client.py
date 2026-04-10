@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import sys
 import threading
 import types
@@ -77,6 +78,35 @@ class FakePyAudioInstance:
         self.terminated = True
 
 
+class FakeTTYStream(io.StringIO):
+    def __init__(self, *, is_tty: bool):
+        super().__init__()
+        self._is_tty = is_tty
+        self.flush_calls = 0
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+    def flush(self) -> None:
+        self.flush_calls += 1
+        super().flush()
+
+
+class FakeVisualizer:
+    def __init__(self):
+        self.renders = []
+        self.finish_calls = 0
+        self.state_label = None
+
+    def render(self, level: float, *, state_label: str | None = None) -> None:
+        if state_label is not None:
+            self.state_label = state_label
+        self.renders.append((level, state_label))
+
+    def finish(self) -> None:
+        self.finish_calls += 1
+
+
 def test_duplex_state_interrupts_local_playback_on_speech_start():
     client = _load_module()
     state = client.DuplexState()
@@ -87,6 +117,126 @@ def test_duplex_state_interrupts_local_playback_on_speech_start():
 
     assert state.start_local_speech(playback) is None
     assert playback.interrupt_calls == 1
+
+
+def test_calculate_pcm16_level_returns_zero_for_empty_audio():
+    client = _load_module()
+
+    assert client.calculate_pcm16_level(b"") == 0.0
+
+
+def test_calculate_pcm16_level_uses_peak_absolute_sample():
+    client = _load_module()
+    quiet = int(0.25 * 32768).to_bytes(2, byteorder="little", signed=True)
+    loud = int(-0.5 * 32768).to_bytes(2, byteorder="little", signed=True)
+
+    assert client.calculate_pcm16_level(quiet + loud) == pytest.approx(0.5)
+
+
+def test_calculate_pcm16_level_ignores_odd_trailing_byte():
+    client = _load_module()
+    sample = int(0.25 * 32768).to_bytes(2, byteorder="little", signed=True)
+
+    assert client.calculate_pcm16_level(sample + b"\xff") == pytest.approx(0.25)
+
+
+def test_terminal_visualizer_renders_single_line_bar_and_tracks_state_label():
+    client = _load_module()
+    stream = FakeTTYStream(is_tty=True)
+    visualizer = client.TerminalVisualizer(stream=stream, width=8)
+
+    visualizer.render(0.5, state_label="LISTEN")
+
+    assert visualizer.enabled is True
+    assert visualizer.state_label == "LISTEN"
+    assert stream.getvalue() == "\rLISTEN [####----]"
+    assert stream.flush_calls == 1
+
+
+def test_terminal_visualizer_clears_stale_characters_on_shorter_render():
+    client = _load_module()
+    stream = FakeTTYStream(is_tty=True)
+    visualizer = client.TerminalVisualizer(stream=stream, width=4)
+
+    visualizer.render(1.0, state_label="LONG")
+    visualizer.render(0.0, state_label="S")
+
+    assert stream.getvalue() == "\rLONG [####]\rS [----]   "
+
+
+def test_terminal_visualizer_finish_appends_newline_once():
+    client = _load_module()
+    stream = FakeTTYStream(is_tty=True)
+    visualizer = client.TerminalVisualizer(stream=stream, width=4)
+
+    visualizer.render(1.0, state_label="PLAY")
+    visualizer.finish()
+    visualizer.finish()
+
+    assert stream.getvalue() == "\rPLAY [####]\n"
+
+
+def test_terminal_visualizer_disabled_skips_rendering_and_cleanup():
+    client = _load_module()
+    stream = FakeTTYStream(is_tty=False)
+    visualizer = client.TerminalVisualizer(stream=stream, width=6)
+
+    visualizer.render(0.5, state_label="IDLE")
+    visualizer.finish()
+
+    assert visualizer.enabled is False
+    assert visualizer.state_label == "IDLE"
+    assert stream.getvalue() == ""
+
+
+def test_terminal_visualizer_uses_current_stderr_when_stream_is_omitted(monkeypatch):
+    client = _load_module()
+    stdout_stream = FakeTTYStream(is_tty=True)
+    stderr_stream = FakeTTYStream(is_tty=True)
+
+    monkeypatch.setattr(sys, "stdout", stdout_stream)
+    monkeypatch.setattr(sys, "stderr", stderr_stream)
+
+    visualizer = client.TerminalVisualizer(width=4)
+    visualizer.render(0.5, state_label="NOW")
+
+    assert stderr_stream.getvalue() == "\rNOW [##--]"
+
+
+def test_terminal_visualizer_default_constructor_stays_enabled_when_stderr_is_tty(
+    monkeypatch,
+):
+    client = _load_module()
+    stdout_stream = FakeTTYStream(is_tty=False)
+    stderr_stream = FakeTTYStream(is_tty=True)
+
+    monkeypatch.setattr(sys, "stdout", stdout_stream)
+    monkeypatch.setattr(sys, "stderr", stderr_stream)
+
+    visualizer = client.TerminalVisualizer(width=4)
+    visualizer.render(0.5, state_label="NOW")
+    visualizer.finish()
+
+    assert visualizer.enabled is True
+    assert stderr_stream.getvalue() == "\rNOW [##--]\n"
+
+
+def test_terminal_visualizer_default_constructor_disables_when_stderr_is_not_a_tty(
+    monkeypatch,
+):
+    client = _load_module()
+    stdout_stream = FakeTTYStream(is_tty=True)
+    stderr_stream = FakeTTYStream(is_tty=False)
+
+    monkeypatch.setattr(sys, "stdout", stdout_stream)
+    monkeypatch.setattr(sys, "stderr", stderr_stream)
+
+    visualizer = client.TerminalVisualizer(width=4)
+    visualizer.render(0.5, state_label="NOW")
+    visualizer.finish()
+
+    assert visualizer.enabled is False
+    assert stderr_stream.getvalue() == ""
 
 
 def test_duplex_state_drops_stale_audio_after_local_interrupt():
@@ -160,6 +310,42 @@ def test_duplex_state_tracks_session_and_response_lifecycle():
         state.handle_event({"type": "response_done", "response_id": 3}, playback)
         is None
     )
+
+
+def test_duplex_state_renders_listening_when_local_speech_starts_without_barge_in():
+    client = _load_module()
+    visualizer = FakeVisualizer()
+    state = client.DuplexState(visualizer=visualizer)
+    playback = FakePlayback()
+
+    assert state.start_local_speech(playback) == {"type": "speech_start"}
+    assert state.end_local_speech() == {"type": "speech_end"}
+
+    assert visualizer.renders == [
+        (0.0, "LISTENING"),
+        (0.0, "IDLE"),
+    ]
+
+
+def test_duplex_state_renders_interrupted_only_for_barge_in():
+    client = _load_module()
+    visualizer = FakeVisualizer()
+    state = client.DuplexState(visualizer=visualizer)
+    playback = FakePlayback()
+
+    assert state.handle_event({"type": "listening"}, playback) == {"type": "listening"}
+    assert state.handle_event(
+        {"type": "assistant_text", "text": "hi", "response_id": 1}, playback
+    ) == {"type": "assistant_text", "text": "hi", "response_id": 1}
+    assert state.start_local_speech(playback) == {"type": "speech_start"}
+    assert state.end_local_speech() == {"type": "speech_end"}
+
+    assert visualizer.renders == [
+        (0.0, "LISTENING"),
+        (0.0, "ASSISTANT"),
+        (0.0, "INTERRUPTED"),
+        (0.0, "IDLE"),
+    ]
 
 
 def test_open_audio_streams_and_main_use_expected_runtime_configuration(monkeypatch):
@@ -238,6 +424,17 @@ class FakeWebSocket:
         return next(self._messages)
 
 
+class FakeConnectContext:
+    def __init__(self, websocket):
+        self.websocket = websocket
+
+    async def __aenter__(self):
+        return self.websocket
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
 @pytest.mark.asyncio
 async def test_playback_controller_interrupt_drops_buffered_audio():
     client = _load_module()
@@ -264,6 +461,215 @@ async def test_playback_controller_interrupt_drops_buffered_audio():
     assert stream.writes == [b"first", b"third"]
     assert stream.stop_calls == 0
     assert stream.start_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_playback_controller_updates_visualizer_from_playback_frames():
+    client = _load_module()
+    stream = FakeStream()
+    visualizer = FakeVisualizer()
+    playback = client.PlaybackController(stream, visualizer=visualizer)
+    sample = int(0.5 * 32768).to_bytes(2, byteorder="little", signed=True)
+
+    task = asyncio.create_task(playback.run())
+    playback.enqueue(sample)
+
+    for _ in range(20):
+        if stream.writes == [sample]:
+            break
+        await asyncio.sleep(0.01)
+    await playback.close()
+    await task
+
+    assert stream.writes == [sample]
+    assert visualizer.renders == [(pytest.approx(0.5), None)]
+    assert visualizer.finish_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_response_done_keeps_assistant_state_until_playback_drains():
+    client = _load_module()
+    stream = FakeStream()
+    stream.block_writes = True
+    visualizer = FakeVisualizer()
+    playback = client.PlaybackController(stream, visualizer=visualizer)
+    state = client.DuplexState(visualizer=visualizer)
+    sample = int(0.5 * 32768).to_bytes(2, byteorder="little", signed=True)
+
+    playback.set_on_drain(state.playback_drained)
+
+    task = asyncio.create_task(playback.run())
+
+    assert state.handle_event(
+        {"type": "assistant_text", "text": "hi", "response_id": 1}, playback
+    ) == {"type": "assistant_text", "text": "hi", "response_id": 1}
+    assert state.handle_event({"type": "audio_chunk", "response_id": 1}, playback) == {
+        "type": "audio_chunk",
+        "response_id": 1,
+    }
+    assert state.handle_audio_bytes(sample, playback) is True
+    await asyncio.to_thread(stream.write_started.wait, 1)
+
+    renders_before_done = list(visualizer.renders)
+    assert state.handle_event(
+        {"type": "response_done", "response_id": 1}, playback
+    ) == {
+        "type": "response_done",
+        "response_id": 1,
+    }
+
+    assert visualizer.renders == renders_before_done
+    assert visualizer.state_label == "ASSISTANT"
+
+    stream.write_release.set()
+    for _ in range(20):
+        if visualizer.state_label == "IDLE":
+            break
+        await asyncio.sleep(0.01)
+
+    await playback.close()
+    await task
+
+    assert visualizer.state_label == "IDLE"
+
+
+@pytest.mark.asyncio
+async def test_local_barge_in_during_playback_drain_renders_interrupted():
+    client = _load_module()
+    stream = FakeStream()
+    stream.block_writes = True
+    visualizer = FakeVisualizer()
+    playback = client.PlaybackController(stream, visualizer=visualizer)
+    state = client.DuplexState(visualizer=visualizer)
+    sample = int(0.5 * 32768).to_bytes(2, byteorder="little", signed=True)
+
+    playback.set_on_drain(state.playback_drained)
+
+    task = asyncio.create_task(playback.run())
+
+    assert state.handle_event(
+        {"type": "assistant_text", "text": "hi", "response_id": 1}, playback
+    ) == {"type": "assistant_text", "text": "hi", "response_id": 1}
+    assert state.handle_event({"type": "audio_chunk", "response_id": 1}, playback) == {
+        "type": "audio_chunk",
+        "response_id": 1,
+    }
+    assert state.handle_audio_bytes(sample, playback) is True
+    await asyncio.to_thread(stream.write_started.wait, 1)
+
+    assert state.handle_event(
+        {"type": "response_done", "response_id": 1}, playback
+    ) == {
+        "type": "response_done",
+        "response_id": 1,
+    }
+
+    assert state.start_local_speech(playback) == {"type": "speech_start"}
+    assert visualizer.state_label == "INTERRUPTED"
+
+    stream.write_release.set()
+    await playback.close()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_run_client_builds_visualizer_and_attaches_it_to_playback_and_state(
+    monkeypatch,
+):
+    client = _load_module()
+    input_stream = FakeStream()
+    output_stream = FakeStream()
+    audio_api = FakePyAudioInstance()
+    captured = {}
+    created_visualizers = []
+
+    class RecordingVisualizer(FakeVisualizer):
+        def __init__(self):
+            super().__init__()
+            created_visualizers.append(self)
+
+    class RecordingPlayback:
+        def __init__(self, stream, *, visualizer=None):
+            captured["playback_stream"] = stream
+            captured["playback_visualizer"] = visualizer
+
+        def set_on_drain(self, callback):
+            captured["playback_on_drain"] = callback
+
+        async def run(self):
+            return None
+
+        async def close(self):
+            return None
+
+    class RecordingState:
+        def __init__(self, sample=None, *, visualizer=None):
+            captured["state_sample"] = sample
+            captured["state_visualizer"] = visualizer
+
+        def playback_drained(self):
+            captured["state_playback_drained"] = True
+
+    websocket = types.SimpleNamespace()
+
+    async def fake_send(message):
+        captured.setdefault("messages", []).append(message)
+
+    websocket.send = fake_send
+
+    async def fake_receive_loop(ws, state, playback, *, event_sink=None):
+        captured["receive_loop"] = (ws, state, playback, event_sink)
+
+    async def fake_microphone_loop(
+        ws,
+        state,
+        input_stream_arg,
+        playback,
+        torch_module,
+        silero_vad_module,
+    ):
+        captured["microphone_loop"] = (
+            ws,
+            state,
+            input_stream_arg,
+            playback,
+            torch_module,
+            silero_vad_module,
+        )
+
+    monkeypatch.setattr(
+        client,
+        "open_audio_streams",
+        lambda pyaudio_module: (audio_api, input_stream, output_stream),
+    )
+    monkeypatch.setattr(client, "TerminalVisualizer", RecordingVisualizer)
+    monkeypatch.setattr(client, "PlaybackController", RecordingPlayback)
+    monkeypatch.setattr(client, "DuplexState", RecordingState)
+    monkeypatch.setattr(client, "receive_loop", fake_receive_loop)
+    monkeypatch.setattr(client, "microphone_loop", fake_microphone_loop)
+
+    websockets_module = types.SimpleNamespace(
+        connect=lambda url: FakeConnectContext(websocket)
+    )
+    pyaudio_module = types.SimpleNamespace()
+    torch_module = types.SimpleNamespace()
+    silero_vad_module = types.SimpleNamespace()
+
+    await client.run_client(
+        "ws://example/ws/conversation",
+        "agent",
+        websockets_module,
+        pyaudio_module,
+        torch_module,
+        silero_vad_module,
+    )
+
+    assert len(created_visualizers) == 1
+    assert captured["playback_stream"] is output_stream
+    assert captured["playback_visualizer"] is created_visualizers[0]
+    assert captured["state_sample"] == "agent"
+    assert captured["state_visualizer"] is created_visualizers[0]
+    assert captured["playback_on_drain"] == captured["receive_loop"][1].playback_drained
 
 
 @pytest.mark.asyncio

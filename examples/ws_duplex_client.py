@@ -14,6 +14,64 @@ PLAYBACK_SAMPLE_RATE = 24000
 AUDIO_CHANNELS = 1
 UPLINK_CHUNK_SIZE = 512
 PLAYBACK_FRAME_BYTES = 960
+VISUALIZER_IDLE = "IDLE"
+VISUALIZER_LISTENING = "LISTENING"
+VISUALIZER_ASSISTANT = "ASSISTANT"
+VISUALIZER_INTERRUPTED = "INTERRUPTED"
+
+
+def calculate_pcm16_level(audio: bytes) -> float:
+    if len(audio) < 2:
+        return 0.0
+
+    peak = 0
+    limit = len(audio) - (len(audio) % 2)
+    for offset in range(0, limit, 2):
+        sample = int.from_bytes(audio[offset : offset + 2], "little", signed=True)
+        peak = max(peak, abs(sample))
+    return min(peak / 32768.0, 1.0)
+
+
+class TerminalVisualizer:
+    def __init__(self, stream=None, *, width: int = 20):
+        self.stream = sys.stderr if stream is None else stream
+        self.width = width
+        self.state_label = "IDLE"
+        self._rendered = False
+        self._finished = False
+        self._last_line_length = 0
+
+    @property
+    def enabled(self) -> bool:
+        isatty = getattr(self.stream, "isatty", None)
+        return bool(callable(isatty) and isatty())
+
+    def render(self, level: float, *, state_label: str | None = None) -> None:
+        if state_label is not None:
+            self.state_label = state_label
+        if not self.enabled:
+            return
+
+        clamped = max(0.0, min(level, 1.0))
+        filled = min(self.width, int(clamped * self.width))
+        bar = "#" * filled + "-" * (self.width - filled)
+        line = f"{self.state_label} [{bar}]"
+        padding = " " * max(0, self._last_line_length - len(line))
+        self.stream.write(f"\r{line}{padding}")
+        self.stream.flush()
+        self._rendered = True
+        self._finished = False
+        self._last_line_length = max(self._last_line_length, len(line))
+
+    def finish(self) -> None:
+        if not self.enabled or not self._rendered or self._finished:
+            return
+
+        self.stream.write("\n")
+        self.stream.flush()
+        self._finished = True
+        self._rendered = False
+        self._last_line_length = 0
 
 
 def build_session_start(
@@ -38,15 +96,22 @@ class DuplexState:
     last_response_id: int | None = None
     active_response_id: int | None = None
     pending_audio_response_id: int | None = None
+    visualizer: TerminalVisualizer | None = None
+    playback_waiting_for_drain: bool = False
 
     def start_local_speech(self, playback) -> dict[str, object] | None:
         if self.local_speech_active:
             return None
 
+        was_barge_in = self._has_assistant_playback(playback)
+        self.playback_waiting_for_drain = False
         self.local_speech_active = True
         self.server_listening = False
         self.active_response_id = None
         playback.interrupt()
+        self._render_visualizer(
+            VISUALIZER_INTERRUPTED if was_barge_in else VISUALIZER_LISTENING
+        )
         return {"type": "speech_start"}
 
     def end_local_speech(self) -> dict[str, object] | None:
@@ -54,13 +119,12 @@ class DuplexState:
             return None
 
         self.local_speech_active = False
+        self._render_visualizer(VISUALIZER_IDLE)
         return {"type": "speech_end"}
 
     def handle_event(
         self, event: dict[str, object], playback
     ) -> dict[str, object] | None:
-        del playback
-
         event_type = event.get("type")
         if event_type == "audio_chunk":
             if self.pending_audio_response_id is not None:
@@ -79,14 +143,17 @@ class DuplexState:
             self.session_started = True
             self.sample = str(event["sample"]) if event.get("sample") else None
             self.sample_rate = int(event.get("sample_rate", UPLINK_SAMPLE_RATE))
+            self._render_visualizer(VISUALIZER_IDLE)
             return event
 
         if event_type == "listening":
             self.server_listening = True
+            self._render_visualizer(VISUALIZER_LISTENING)
             return event
 
         if event_type == "transcript_final":
             self.server_listening = False
+            self._render_visualizer(VISUALIZER_IDLE)
             return event
 
         if event_type in {
@@ -104,10 +171,23 @@ class DuplexState:
                 return None
 
             if event_type == "audio_chunk":
+                self.playback_waiting_for_drain = False
                 self.pending_audio_response_id = response_id
+                self._render_visualizer(VISUALIZER_ASSISTANT)
             elif event_type in {"response_done", "interrupted"}:
                 self.pending_audio_response_id = None
                 self.active_response_id = None
+                if event_type == "interrupted":
+                    self.playback_waiting_for_drain = False
+                    self._render_visualizer(VISUALIZER_INTERRUPTED)
+                elif self._playback_has_pending_audio(playback):
+                    self.playback_waiting_for_drain = True
+                else:
+                    self.playback_waiting_for_drain = False
+                    self._render_visualizer(VISUALIZER_IDLE)
+            else:
+                self.playback_waiting_for_drain = False
+                self._render_visualizer(VISUALIZER_ASSISTANT)
             return event
 
         return event
@@ -138,14 +218,38 @@ class DuplexState:
 
         return self.active_response_id == response_id
 
+    def _render_visualizer(self, state_label: str) -> None:
+        if self.visualizer is not None:
+            self.visualizer.render(0.0, state_label=state_label)
+
+    def playback_drained(self) -> None:
+        if self.playback_waiting_for_drain and not self.local_speech_active:
+            self.playback_waiting_for_drain = False
+            self._render_visualizer(VISUALIZER_IDLE)
+
+    def _playback_has_pending_audio(self, playback) -> bool:
+        has_pending_audio = getattr(playback, "has_pending_audio", None)
+        return bool(callable(has_pending_audio) and has_pending_audio())
+
+    def _has_assistant_playback(self, playback) -> bool:
+        return (
+            self.active_response_id is not None
+            or self.pending_audio_response_id is not None
+            or self.playback_waiting_for_drain
+            or self._playback_has_pending_audio(playback)
+        )
+
 
 class PlaybackController:
-    def __init__(self, stream):
+    def __init__(self, stream, *, visualizer: TerminalVisualizer | None = None):
         self.stream = stream
+        self.visualizer = visualizer
         self._generation = 0
         self._closed = False
         self._pending: deque[tuple[int, bytes]] = deque()
         self._signals: asyncio.Queue[None] = asyncio.Queue()
+        self._writing = False
+        self._on_drain = None
 
     def enqueue(self, audio: bytes) -> None:
         if self._closed:
@@ -164,6 +268,12 @@ class PlaybackController:
         self._pending.clear()
         self._signal()
 
+    def has_pending_audio(self) -> bool:
+        return self._writing or bool(self._pending)
+
+    def set_on_drain(self, callback) -> None:
+        self._on_drain = callback
+
     async def run(self) -> None:
         while True:
             if not self._pending:
@@ -175,7 +285,13 @@ class PlaybackController:
             generation, audio = self._pending.popleft()
             if generation != self._generation:
                 continue
+            self._writing = True
+            if self.visualizer is not None:
+                self.visualizer.render(calculate_pcm16_level(audio))
             await asyncio.to_thread(self.stream.write, audio)
+            self._writing = False
+            if not self._pending and not self._closed and self._on_drain is not None:
+                self._on_drain()
             if self._closed:
                 return
 
@@ -183,6 +299,8 @@ class PlaybackController:
         self._closed = True
         self._generation += 1
         self._pending.clear()
+        if self.visualizer is not None:
+            self.visualizer.finish()
         self._signal()
 
     def _signal(self) -> None:
@@ -301,8 +419,10 @@ async def run_client(
         microphone_task = None
         try:
             audio_api, input_stream, output_stream = open_audio_streams(pyaudio_module)
-            playback = PlaybackController(output_stream)
-            state = DuplexState(sample=sample)
+            visualizer = TerminalVisualizer()
+            playback = PlaybackController(output_stream, visualizer=visualizer)
+            state = DuplexState(sample=sample, visualizer=visualizer)
+            playback.set_on_drain(state.playback_drained)
 
             playback_task = asyncio.create_task(playback.run())
             receiver_task = asyncio.create_task(
