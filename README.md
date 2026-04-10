@@ -193,8 +193,11 @@ Example invocation:
 ```bash
 python examples/ws_duplex_client.py \
   --url ws://server-host:8000/ws/conversation \
-  --sample your-sample-name
+  --sample your-sample-name \
+  --language it
 ```
+
+Use `--language <code>` when you want to force the ASR language for the whole session, for example `--language it` for Italian. If omitted, the server falls back to per-session language detection and sticky language hints.
 
 Manual duplex smoke flow for a real workstation + server setup:
 
@@ -206,7 +209,8 @@ Manual duplex smoke flow for a real workstation + server setup:
 docker compose up -d --build
 python examples/ws_duplex_client.py \
   --url ws://localhost:8000/ws/conversation \
-  --sample your-sample-name
+  --sample your-sample-name \
+  --language it
 ```
 
 Expected behavior:
