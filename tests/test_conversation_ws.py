@@ -25,6 +25,11 @@ from conversation_ws import (
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
 
+AUDIO_CHUNK_A = b"a" * 12000
+AUDIO_CHUNK_B = b"b" * 12000
+AUDIO_CHUNK_C = b"c" * 12000
+AUDIO_CHUNK_D = b"d" * 12000
+
 
 def _load_app_module(module_name: str, filename: str):
     module_path = APP_DIR / filename
@@ -1209,7 +1214,7 @@ def test_session_start_rejects_unsupported_positive_sample_rate(sample_rate: int
 
 
 def test_audio_input_limit_returns_controlled_error_and_resets_collection():
-    client, service = _make_client(max_input_bytes=5)
+    client, service = _make_client(max_input_bytes=len(AUDIO_CHUNK_A) + 1)
 
     with client.websocket_connect("/ws/conversation") as ws:
         ws.send_json({"type": "session_start", "sample": "agent-voice"})
@@ -1218,8 +1223,8 @@ def test_audio_input_limit_returns_controlled_error_and_resets_collection():
         ws.send_json({"type": "speech_start"})
         assert ws.receive_json() == {"type": "listening"}
 
-        ws.send_bytes(b"abc")
-        ws.send_bytes(b"def")
+        ws.send_bytes(AUDIO_CHUNK_A)
+        ws.send_bytes(AUDIO_CHUNK_B)
 
         assert ws.receive_json() == {
             "type": "error",
@@ -1245,8 +1250,8 @@ def test_speech_end_triggers_transcript_and_assistant_response():
         ws.send_json({"type": "speech_start"})
         assert ws.receive_json() == {"type": "listening"}
 
-        ws.send_bytes(b"abc")
-        ws.send_bytes(b"def")
+        ws.send_bytes(AUDIO_CHUNK_A)
+        ws.send_bytes(AUDIO_CHUNK_B)
         ws.send_json({"type": "speech_end"})
 
         assert ws.receive_json() == {"type": "transcript_final", "text": "hello there"}
@@ -1261,7 +1266,7 @@ def test_speech_end_triggers_transcript_and_assistant_response():
         assert ws.receive_bytes() == b"audio-bytes"
         assert ws.receive_json() == {"type": "response_done", "response_id": 1}
 
-    assert service.transcribe_calls == [(b"abcdef", 16000)]
+    assert service.transcribe_calls == [(AUDIO_CHUNK_A + AUDIO_CHUNK_B, 16000)]
 
 
 def test_detected_language_without_probability_keeps_existing_session_language_hint():
@@ -1280,7 +1285,7 @@ def test_detected_language_without_probability_keeps_existing_session_language_h
         for response_id in range(1, 5):
             ws.send_json({"type": "speech_start"})
             assert ws.receive_json() == {"type": "listening"}
-            ws.send_bytes(f"turn-{response_id}".encode("ascii"))
+            ws.send_bytes(bytes([96 + response_id]) * 12000)
             ws.send_json({"type": "speech_end"})
 
             assert ws.receive_json() == {
@@ -1345,7 +1350,7 @@ def test_language_override_stays_sticky_across_turns():
         for response_id in range(1, 3):
             ws.send_json({"type": "speech_start"})
             assert ws.receive_json() == {"type": "listening"}
-            ws.send_bytes(b"abc")
+            ws.send_bytes(AUDIO_CHUNK_A)
             ws.send_json({"type": "speech_end"})
             ws.receive_json()
             ws.receive_json()
@@ -1382,7 +1387,7 @@ def test_detected_language_below_threshold_does_not_replace_session_language_hin
         for response_id in range(1, 3):
             ws.send_json({"type": "speech_start"})
             assert ws.receive_json() == {"type": "listening"}
-            ws.send_bytes(b"abc")
+            ws.send_bytes(AUDIO_CHUNK_A)
             ws.send_json({"type": "speech_end"})
             ws.receive_json()
             ws.receive_json()
@@ -1414,7 +1419,7 @@ def test_detected_language_above_threshold_updates_session_language_hint():
         for response_id in range(1, 4):
             ws.send_json({"type": "speech_start"})
             assert ws.receive_json() == {"type": "listening"}
-            ws.send_bytes(b"abc")
+            ws.send_bytes(AUDIO_CHUNK_A)
             ws.send_json({"type": "speech_end"})
             ws.receive_json()
             ws.receive_json()
@@ -1516,7 +1521,7 @@ def test_repeated_session_start_resets_session_state_on_same_socket():
 
         ws.send_json({"type": "speech_start"})
         assert ws.receive_json() == {"type": "listening"}
-        ws.send_bytes(b"first")
+        ws.send_bytes(AUDIO_CHUNK_A)
         ws.send_json({"type": "speech_end"})
         assert ws.receive_json() == {
             "type": "transcript_final",
@@ -1552,7 +1557,7 @@ def test_repeated_session_start_resets_session_state_on_same_socket():
 
         ws.send_json({"type": "speech_start"})
         assert ws.receive_json() == {"type": "listening"}
-        ws.send_bytes(b"fresh")
+        ws.send_bytes(AUDIO_CHUNK_B)
         ws.send_json({"type": "speech_end"})
         assert ws.receive_json() == {
             "type": "transcript_final",
@@ -1568,7 +1573,7 @@ def test_repeated_session_start_resets_session_state_on_same_socket():
         assert ws.receive_bytes() == b"audio-bytes"
         assert ws.receive_json() == {"type": "response_done", "response_id": 2}
 
-    assert service.transcribe_calls == [(b"first", 16000), (b"fresh", 16000)]
+    assert service.transcribe_calls == [(AUDIO_CHUNK_A, 16000), (AUDIO_CHUNK_B, 16000)]
     assert service.transcribe_contexts[0]["language_hint"] is None
     assert service.transcribe_contexts[1]["language_hint"] == "fr"
     assert service.response_contexts[0]["history"] == []
@@ -1655,7 +1660,7 @@ def test_barge_in_speech_start_emits_interrupted_for_active_response():
 
         ws.send_json({"type": "speech_start"})
         ws.receive_json()
-        ws.send_bytes(b"abc")
+        ws.send_bytes(AUDIO_CHUNK_A)
         ws.send_json({"type": "speech_end"})
 
         assert ws.receive_json() == {"type": "transcript_final", "text": "hello there"}
@@ -1673,6 +1678,49 @@ def test_barge_in_speech_start_emits_interrupted_for_active_response():
         service.response_released[1].set()
 
 
+def test_short_utterance_skips_asr_and_returns_done_only():
+    client, service = _make_client()
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json({"type": "session_start", "sample": "agent-voice"})
+        ws.receive_json()
+
+        ws.send_json({"type": "speech_start"})
+        assert ws.receive_json() == {"type": "listening"}
+        ws.send_bytes(b"x" * 1024)
+        ws.send_json({"type": "speech_end"})
+
+        assert ws.receive_json() == {"type": "response_done", "response_id": 1}
+
+    assert service.transcribe_calls == []
+    assert service.response_started == []
+
+
+def test_suspicious_transcript_is_dropped_before_assistant_response():
+    client, service = _make_client()
+    service.transcript_results = [
+        FakeTranscriptionResult(
+            "Sottotitoli e revisione a cura di QTSS",
+            language="it",
+            language_probability=0.94,
+        )
+    ]
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json({"type": "session_start", "sample": "agent-voice"})
+        ws.receive_json()
+
+        ws.send_json({"type": "speech_start"})
+        assert ws.receive_json() == {"type": "listening"}
+        ws.send_bytes(b"x" * 12000)
+        ws.send_json({"type": "speech_end"})
+
+        assert ws.receive_json() == {"type": "response_done", "response_id": 1}
+
+    assert service.transcribe_calls == [(b"x" * 12000, 16000)]
+    assert service.response_started == []
+
+
 def test_duplicate_speech_start_returns_error_and_keeps_buffered_audio():
     client, service = _make_client()
 
@@ -1683,7 +1731,7 @@ def test_duplicate_speech_start_returns_error_and_keeps_buffered_audio():
         ws.send_json({"type": "speech_start"})
         assert ws.receive_json() == {"type": "listening"}
 
-        ws.send_bytes(b"abc")
+        ws.send_bytes(AUDIO_CHUNK_A)
         ws.send_json({"type": "speech_start"})
 
         assert ws.receive_json() == {
@@ -1692,7 +1740,7 @@ def test_duplicate_speech_start_returns_error_and_keeps_buffered_audio():
             "code": "INVALID_MESSAGE",
         }
 
-        ws.send_bytes(b"def")
+        ws.send_bytes(AUDIO_CHUNK_B)
         ws.send_json({"type": "speech_end"})
 
         assert ws.receive_json() == {"type": "transcript_final", "text": "hello there"}
@@ -1707,7 +1755,7 @@ def test_duplicate_speech_start_returns_error_and_keeps_buffered_audio():
         assert ws.receive_bytes() == b"audio-bytes"
         assert ws.receive_json() == {"type": "response_done", "response_id": 1}
 
-    assert service.transcribe_calls == [(b"abcdef", 16000)]
+    assert service.transcribe_calls == [(AUDIO_CHUNK_A + AUDIO_CHUNK_B, 16000)]
 
 
 def test_input_audio_chunk_message_appends_audio_payload():
@@ -1723,10 +1771,10 @@ def test_input_audio_chunk_message_appends_audio_payload():
         ws.send_json(
             {
                 "type": "input_audio_chunk",
-                "audio": base64.b64encode(b"abc").decode("ascii"),
+                "audio": base64.b64encode(AUDIO_CHUNK_A).decode("ascii"),
             }
         )
-        ws.send_bytes(b"def")
+        ws.send_bytes(AUDIO_CHUNK_B)
         ws.send_json({"type": "speech_end"})
 
         assert ws.receive_json() == {"type": "transcript_final", "text": "hello there"}
@@ -1741,7 +1789,7 @@ def test_input_audio_chunk_message_appends_audio_payload():
         assert ws.receive_bytes() == b"audio-bytes"
         assert ws.receive_json() == {"type": "response_done", "response_id": 1}
 
-    assert service.transcribe_calls == [(b"abcdef", 16000)]
+    assert service.transcribe_calls == [(AUDIO_CHUNK_A + AUDIO_CHUNK_B, 16000)]
 
 
 def test_unexpected_audio_before_speech_start_returns_error():
@@ -1751,7 +1799,7 @@ def test_unexpected_audio_before_speech_start_returns_error():
         ws.send_json({"type": "session_start", "sample": "agent-voice"})
         ws.receive_json()
 
-        ws.send_bytes(b"abc")
+        ws.send_bytes(AUDIO_CHUNK_A)
 
         assert ws.receive_json() == {
             "type": "error",
@@ -1791,7 +1839,7 @@ def test_transcribe_failure_returns_controlled_error_and_session_continues():
 
         ws.send_json({"type": "speech_start"})
         assert ws.receive_json() == {"type": "listening"}
-        ws.send_bytes(b"abc")
+        ws.send_bytes(AUDIO_CHUNK_A)
         ws.send_json({"type": "speech_end"})
 
         assert ws.receive_json() == {
@@ -2239,7 +2287,7 @@ def test_response_task_failure_returns_controlled_error_event():
 
         ws.send_json({"type": "speech_start"})
         ws.receive_json()
-        ws.send_bytes(b"abc")
+        ws.send_bytes(AUDIO_CHUNK_A)
         ws.send_json({"type": "speech_end"})
 
         assert ws.receive_json() == {"type": "transcript_final", "text": "hello there"}

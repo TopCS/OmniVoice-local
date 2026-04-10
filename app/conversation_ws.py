@@ -17,6 +17,12 @@ from starlette.websockets import WebSocketState
 
 SUPPORTED_SAMPLE_RATE = 16000
 DEFAULT_MAX_INPUT_BYTES = 1024 * 1024
+MIN_TRANSCRIBE_AUDIO_BYTES = 8192
+SUSPICIOUS_TRANSCRIPT_MARKERS = (
+    "sottotitoli e revisione a cura",
+    "amara.org",
+    "qtss",
+)
 
 
 @dataclass
@@ -233,6 +239,14 @@ async def _handle_event(
         state.audio_chunks.clear()
         state.buffered_audio_bytes = 0
 
+        if _should_skip_short_utterance(audio_bytes):
+            response_id = state.next_response_id
+            state.next_response_id += 1
+            await websocket.send_json(
+                {"type": "response_done", "response_id": response_id}
+            )
+            return
+
         try:
             transcript_result = await _call_service_transcribe(
                 service,
@@ -258,6 +272,18 @@ async def _handle_event(
             threshold=sticky_language_min_prob,
         ):
             state.last_detected_language = detected_language
+
+        if _should_drop_suspicious_transcript(
+            transcript,
+            audio_bytes,
+            detected_language_probability,
+        ):
+            response_id = state.next_response_id
+            state.next_response_id += 1
+            await websocket.send_json(
+                {"type": "response_done", "response_id": response_id}
+            )
+            return
 
         await websocket.send_json(transcript_payload)
 
@@ -595,6 +621,37 @@ def _should_update_detected_language(
     if not isinstance(detected_language_probability, (float, int)):
         return current_language is None
     return float(detected_language_probability) >= threshold
+
+
+def _should_skip_short_utterance(audio_bytes: bytes) -> bool:
+    return len(audio_bytes) < MIN_TRANSCRIBE_AUDIO_BYTES
+
+
+def _should_drop_suspicious_transcript(
+    transcript: str,
+    audio_bytes: bytes,
+    detected_language_probability: float | None,
+) -> bool:
+    normalized = transcript.strip().lower()
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in SUSPICIOUS_TRANSCRIPT_MARKERS):
+        return True
+
+    duration_s = len(audio_bytes) / (SUPPORTED_SAMPLE_RATE * 2)
+    word_count = len(normalized.split())
+    if (
+        detected_language_probability is not None
+        and detected_language_probability < 0.5
+        and duration_s <= 0.6
+        and word_count >= 4
+    ):
+        return True
+
+    if duration_s <= 0.35 and word_count >= 3:
+        return True
+
+    return False
 
 
 def _append_history_entry(
