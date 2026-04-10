@@ -891,6 +891,10 @@ async def test_ollama_assistant_backend_uses_structured_context_messages():
                     "role": "system",
                     "content": "Conversation context: session_id=session-123; caller_language_hint=de.",
                 },
+                {
+                    "role": "system",
+                    "content": "Reply only in the caller's language for this turn: German (de).",
+                },
                 {"role": "user", "content": "First caller turn"},
                 {"role": "assistant", "content": "First assistant reply"},
                 {"role": "user", "content": "Second caller turn"},

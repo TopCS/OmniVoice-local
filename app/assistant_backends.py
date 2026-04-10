@@ -9,6 +9,8 @@ PHONE_AGENT_SYSTEM_PROMPT = (
     "Keep replies concise, practical, and easy to say out loud. "
     "Do not repeat the caller's words back unless needed for clarity. "
     "Ask at most one short clarifying question when necessary. "
+    "Always reply in the caller's language. "
+    "If a caller language hint is provided, treat it as authoritative for the reply language. "
     "Output plain text only. "
     "Do not use markdown, bullet points, emojis, JSON, XML, code blocks, "
     "speaker labels, or stage directions."
@@ -83,6 +85,16 @@ def _build_messages(
                 "content": f"Conversation context: {'; '.join(context_parts)}.",
             }
         )
+    if language_hint:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"Reply only in the caller's language for this turn: "
+                    f"{_language_display_name(language_hint)} ({language_hint})."
+                ),
+            }
+        )
 
     for turn in history[-3:]:
         user_text = str(turn.get("user") or "").strip()
@@ -114,3 +126,16 @@ def _extract_message_text(response: Any) -> str:
         raise RuntimeError("Assistant backend returned no usable message content.")
 
     return content.strip()
+
+
+def _language_display_name(language_code: str) -> str:
+    names = {
+        "de": "German",
+        "en": "English",
+        "es": "Spanish",
+        "fr": "French",
+        "it": "Italian",
+        "pt": "Portuguese",
+    }
+    normalized = language_code.strip().lower()
+    return names.get(normalized, normalized)

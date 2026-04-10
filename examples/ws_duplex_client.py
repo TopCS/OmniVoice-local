@@ -332,7 +332,7 @@ def open_audio_streams(pyaudio_module):
 
 
 def pcm16_bytes_to_float_tensor(audio: bytes, torch_module):
-    audio_int16 = torch_module.frombuffer(audio, dtype=torch_module.int16)
+    audio_int16 = torch_module.frombuffer(bytearray(audio), dtype=torch_module.int16)
     return audio_int16.to(dtype=torch_module.float32) / 32768.0
 
 
