@@ -106,9 +106,15 @@ class FakeAssistantBackend:
 
 
 class FakeTranscriptionResult:
-    def __init__(self, text: str, language: str | None = None):
+    def __init__(
+        self,
+        text: str,
+        language: str | None = None,
+        language_probability: float | None = None,
+    ):
         self.text = text
         self.language = language
+        self.language_probability = language_probability
 
 
 def _make_client(*, max_input_bytes: int = 1024 * 1024):
@@ -405,6 +411,7 @@ async def test_server_conversation_service_logs_completed_turn_metrics(
         "session_id": "session-123",
         "response_id": 6,
         "detected_language": "es",
+        "detected_language_probability": None,
         "language_hint": "fr",
         "assistant_backend": "FakeAssistantBackend",
         "assistant_model": "test-model",
@@ -523,6 +530,7 @@ async def test_server_conversation_service_clears_empty_turn_metrics_before_next
             "session_id": "session-123",
             "response_id": 2,
             "detected_language": None,
+            "detected_language_probability": None,
             "language_hint": "fr",
             "assistant_backend": "FakeAssistantBackend",
             "assistant_model": "test-model",
@@ -1252,7 +1260,7 @@ def test_speech_end_triggers_transcript_and_assistant_response():
     assert service.transcribe_calls == [(b"abcdef", 16000)]
 
 
-def test_detected_language_updates_response_context_without_biasing_later_asr_turns():
+def test_detected_language_without_probability_keeps_existing_session_language_hint():
     client, service = _make_client()
     service.transcript_results = [
         FakeTranscriptionResult("first caller turn", language="es"),
@@ -1305,9 +1313,9 @@ def test_detected_language_updates_response_context_without_biasing_later_asr_tu
     ]
     assert [context["language_hint"] for context in service.response_contexts] == [
         "es",
-        "fr",
-        "de",
-        "it",
+        "es",
+        "es",
+        "es",
     ]
     assert service.response_contexts[0]["history"] == []
     assert service.response_contexts[3]["history"] == [
@@ -1350,6 +1358,141 @@ def test_language_override_stays_sticky_across_turns():
         "fr",
         "fr",
     ]
+
+
+def test_detected_language_below_threshold_does_not_replace_session_language_hint():
+    client, service = _make_client()
+    service.transcript_results = [
+        FakeTranscriptionResult(
+            "primo turno italiano", language="it", language_probability=0.97
+        ),
+        FakeTranscriptionResult(
+            "secondo turno sempre italiano", language="el", language_probability=0.28
+        ),
+    ]
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json({"type": "session_start", "sample": "agent-voice"})
+        ws.receive_json()
+
+        for response_id in range(1, 3):
+            ws.send_json({"type": "speech_start"})
+            assert ws.receive_json() == {"type": "listening"}
+            ws.send_bytes(b"abc")
+            ws.send_json({"type": "speech_end"})
+            ws.receive_json()
+            ws.receive_json()
+            service.response_released[response_id].set()
+            ws.receive_json()
+            ws.receive_bytes()
+            ws.receive_json()
+
+    assert [context["language_hint"] for context in service.response_contexts] == [
+        "it",
+        "it",
+    ]
+
+
+def test_detected_language_above_threshold_updates_session_language_hint():
+    client, service = _make_client()
+    service.transcript_results = [
+        FakeTranscriptionResult("ciao", language="it", language_probability=0.95),
+        FakeTranscriptionResult(
+            "always english now", language="en", language_probability=0.99
+        ),
+        FakeTranscriptionResult("third turn", language="en", language_probability=0.88),
+    ]
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json({"type": "session_start", "sample": "agent-voice"})
+        ws.receive_json()
+
+        for response_id in range(1, 4):
+            ws.send_json({"type": "speech_start"})
+            assert ws.receive_json() == {"type": "listening"}
+            ws.send_bytes(b"abc")
+            ws.send_json({"type": "speech_end"})
+            ws.receive_json()
+            ws.receive_json()
+            service.response_released[response_id].set()
+            ws.receive_json()
+            ws.receive_bytes()
+            ws.receive_json()
+
+    assert [context["language_hint"] for context in service.response_contexts] == [
+        "it",
+        "en",
+        "en",
+    ]
+
+
+def test_faster_whisper_asr_adapter_exposes_language_probability(monkeypatch):
+    class FakeWhisperModel:
+        def __init__(self, model_name, **kwargs):
+            pass
+
+        def transcribe(self, audio, **kwargs):
+            class Segment:
+                def __init__(self, text):
+                    self.text = text
+
+            return iter([Segment(" hello")]), types.SimpleNamespace(
+                language="it", language_probability=0.73
+            )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "faster_whisper",
+        types.SimpleNamespace(WhisperModel=FakeWhisperModel),
+    )
+
+    asr = _load_app_module("asr_probability_under_test", "asr.py")
+    adapter = asr.FasterWhisperASR(
+        model_name="small", device="cpu", compute_type="int8"
+    )
+
+    transcript = adapter.transcribe(np.array([0, 1], dtype=np.int16).tobytes())
+
+    assert transcript.language == "it"
+    assert transcript.language_probability == pytest.approx(0.73)
+
+
+@pytest.mark.asyncio
+async def test_conversation_service_warmup_primes_backends(monkeypatch):
+    warm_calls = []
+
+    class FakeASR:
+        def transcribe(self, pcm_bytes: bytes, *, language_hint=None, session_id=None):
+            warm_calls.append(("asr", len(pcm_bytes), language_hint, session_id))
+            return FakeTranscriptionResult("", language="it", language_probability=1.0)
+
+    class FakeAssistantBackend:
+        _model = "gemma4"
+
+        async def generate_response(self, transcript: str, **kwargs):
+            warm_calls.append(("assistant", transcript, kwargs))
+            return "ok"
+
+    class FakeAudio:
+        shape = (1, 2400)
+
+    async def fake_generate_sentence_audio(gen_kwargs):
+        warm_calls.append(("tts", gen_kwargs["text"]))
+        return FakeAudio()
+
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+    service = server.ConversationService(
+        FakeASR(), assistant_backend=FakeAssistantBackend()
+    )
+    monkeypatch.setattr(
+        service, "_generate_sentence_audio", fake_generate_sentence_audio
+    )
+
+    await service.warmup(sample="agent-voice")
+
+    assert any(call[0] == "asr" for call in warm_calls)
+    assert any(call[0] == "assistant" for call in warm_calls)
+    assert any(call[0] == "tts" for call in warm_calls)
 
 
 def test_repeated_session_start_resets_session_state_on_same_socket():

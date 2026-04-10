@@ -75,7 +75,10 @@ class TerminalVisualizer:
 
 
 def build_session_start(
-    *, sample: str | None = None, sample_rate: int = UPLINK_SAMPLE_RATE
+    *,
+    sample: str | None = None,
+    sample_rate: int = UPLINK_SAMPLE_RATE,
+    language: str | None = None,
 ) -> dict[str, object]:
     event: dict[str, object] = {
         "type": "session_start",
@@ -83,6 +86,8 @@ def build_session_start(
     }
     if sample is not None:
         event["sample"] = sample
+    if language is not None:
+        event["language"] = language
     return event
 
 
@@ -402,13 +407,16 @@ async def receive_loop(
 async def run_client(
     url: str,
     sample: str | None,
+    language: str | None,
     websockets_module,
     pyaudio_module,
     torch_module,
     silero_vad_module,
 ) -> None:
     async with websockets_module.connect(url) as websocket:
-        await websocket.send(json.dumps(build_session_start(sample=sample)))
+        await websocket.send(
+            json.dumps(build_session_start(sample=sample, language=language))
+        )
 
         audio_api = None
         input_stream = None
@@ -473,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--url", default="ws://localhost:8000/ws/conversation")
     parser.add_argument("--sample")
+    parser.add_argument("--language")
     args = parser.parse_args(argv)
 
     try:
@@ -510,7 +519,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         asyncio.run(
-            run_client(args.url, args.sample, websockets, pyaudio, torch, silero_vad)
+            run_client(
+                args.url,
+                args.sample,
+                args.language,
+                websockets,
+                pyaudio,
+                torch,
+                silero_vad,
+            )
         )
     except Exception as exc:  # noqa: BLE001
         print(str(exc), file=sys.stderr)

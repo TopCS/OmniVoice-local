@@ -42,6 +42,7 @@ def create_conversation_router(
     *,
     service: Any,
     max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
+    sticky_language_min_prob: float = 0.8,
     active_counter: Callable[[int], None] | None = None,
 ) -> APIRouter:
     """Create router exposing the `/ws/conversation` skeleton endpoint."""
@@ -66,6 +67,7 @@ def create_conversation_router(
                     state,
                     service,
                     max_input_bytes=max_input_bytes,
+                    sticky_language_min_prob=sticky_language_min_prob,
                 )
         except WebSocketDisconnect:
             pass
@@ -85,6 +87,7 @@ async def _handle_incoming(
     service: Any,
     *,
     max_input_bytes: int,
+    sticky_language_min_prob: float,
 ) -> None:
     audio = message.get("bytes")
     if audio is not None:
@@ -113,7 +116,12 @@ async def _handle_incoming(
         return
 
     await _handle_event(
-        websocket, payload, state, service, max_input_bytes=max_input_bytes
+        websocket,
+        payload,
+        state,
+        service,
+        max_input_bytes=max_input_bytes,
+        sticky_language_min_prob=sticky_language_min_prob,
     )
 
 
@@ -124,6 +132,7 @@ async def _handle_event(
     service: Any,
     *,
     max_input_bytes: int,
+    sticky_language_min_prob: float,
 ) -> None:
     msg_type = message.get("type")
     if msg_type == "session_start":
@@ -236,10 +245,18 @@ async def _handle_event(
             await _send_error(websocket, str(exc), "TRANSCRIBE_ERROR")
             return
 
-        transcript, detected_language, transcript_payload = (
-            _normalize_transcript_result(transcript_result)
-        )
-        if detected_language is not None:
+        (
+            transcript,
+            detected_language,
+            detected_language_probability,
+            transcript_payload,
+        ) = _normalize_transcript_result(transcript_result)
+        if _should_update_detected_language(
+            state.last_detected_language,
+            detected_language,
+            detected_language_probability,
+            threshold=sticky_language_min_prob,
+        ):
             state.last_detected_language = detected_language
 
         await websocket.send_json(transcript_payload)
@@ -523,30 +540,61 @@ def _normalize_response_event(event: Any, response_id: int) -> dict[str, Any]:
 
 def _normalize_transcript_result(
     transcript: Any,
-) -> tuple[str, str | None, dict[str, Any]]:
+) -> tuple[str, str | None, float | None, dict[str, Any]]:
     if isinstance(transcript, dict):
         text = str(transcript.get("text") or "").strip()
         language = transcript.get("language")
+        language_probability = transcript.get("language_probability")
         if not isinstance(language, str) or not language.strip():
             language = transcript.get("detected_language")
         if not isinstance(language, str) or not language.strip():
             language = None
+        if not isinstance(language_probability, (float, int)):
+            language_probability = transcript.get("detected_language_probability")
+        if not isinstance(language_probability, (float, int)):
+            language_probability = None
 
-        payload = dict(transcript)
-        payload.setdefault("type", "transcript_final")
-        payload["text"] = text
-        return text, language, payload
+        payload = {"type": "transcript_final", "text": text}
+        return (
+            text,
+            language,
+            float(language_probability) if language_probability is not None else None,
+            payload,
+        )
 
     text = getattr(transcript, "text", transcript)
     language = getattr(transcript, "language", None)
+    language_probability = getattr(transcript, "language_probability", None)
     text = str(text or "").strip()
     if not isinstance(language, str) or not language.strip():
         language = None
-    return text, language, {"type": "transcript_final", "text": text}
+    payload = {"type": "transcript_final", "text": text}
+    return (
+        text,
+        language,
+        float(language_probability)
+        if isinstance(language_probability, (float, int))
+        else None,
+        payload,
+    )
 
 
 def _current_language_hint(state: ConversationSessionState) -> str | None:
     return state.language_override or state.last_detected_language
+
+
+def _should_update_detected_language(
+    current_language: str | None,
+    detected_language: str | None,
+    detected_language_probability: Any,
+    *,
+    threshold: float,
+) -> bool:
+    if not detected_language:
+        return False
+    if not isinstance(detected_language_probability, (float, int)):
+        return current_language is None
+    return float(detected_language_probability) >= threshold
 
 
 def _append_history_entry(

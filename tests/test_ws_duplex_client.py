@@ -239,6 +239,17 @@ def test_terminal_visualizer_default_constructor_disables_when_stderr_is_not_a_t
     assert stderr_stream.getvalue() == ""
 
 
+def test_build_session_start_includes_explicit_language_override():
+    client = _load_module()
+
+    assert client.build_session_start(sample="agent", language="it") == {
+        "type": "session_start",
+        "sample_rate": 16000,
+        "sample": "agent",
+        "language": "it",
+    }
+
+
 def test_duplex_state_drops_stale_audio_after_local_interrupt():
     client = _load_module()
     state = client.DuplexState()
@@ -381,6 +392,7 @@ def test_open_audio_streams_and_main_use_expected_runtime_configuration(monkeypa
     async def fake_run_client(
         url,
         sample,
+        language,
         websockets_module,
         pyaudio_module,
         torch_module,
@@ -390,6 +402,7 @@ def test_open_audio_streams_and_main_use_expected_runtime_configuration(monkeypa
             {
                 "url": url,
                 "sample": sample,
+                "language": language,
                 "websockets": websockets_module,
                 "pyaudio": pyaudio_module,
                 "torch": torch_module,
@@ -404,11 +417,22 @@ def test_open_audio_streams_and_main_use_expected_runtime_configuration(monkeypa
     monkeypatch.setitem(sys.modules, "silero_vad", types.ModuleType("silero_vad"))
 
     assert (
-        client.main(["--url", "ws://example/ws/conversation", "--sample", "agent"]) == 0
+        client.main(
+            [
+                "--url",
+                "ws://example/ws/conversation",
+                "--sample",
+                "agent",
+                "--language",
+                "it",
+            ]
+        )
+        == 0
     )
     assert captured == {
         "url": "ws://example/ws/conversation",
         "sample": "agent",
+        "language": "it",
         "websockets": sys.modules["websockets"],
         "pyaudio": sys.modules["pyaudio"],
         "torch": sys.modules["torch"],
@@ -658,6 +682,7 @@ async def test_run_client_builds_visualizer_and_attaches_it_to_playback_and_stat
     await client.run_client(
         "ws://example/ws/conversation",
         "agent",
+        None,
         websockets_module,
         pyaudio_module,
         torch_module,

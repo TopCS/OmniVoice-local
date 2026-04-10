@@ -157,8 +157,14 @@ CONVERSATION_WS_ENABLED = os.environ.get(
 ASR_MODEL = os.environ.get("OMNIVOICE_ASR_MODEL", "small")
 ASR_DEVICE = os.environ.get("OMNIVOICE_ASR_DEVICE", "auto")
 ASR_COMPUTE_TYPE = os.environ.get("OMNIVOICE_ASR_COMPUTE_TYPE", "default")
+ASR_LANGUAGE_STICKY_MIN_PROB = float(
+    os.environ.get("OMNIVOICE_ASR_LANGUAGE_STICKY_MIN_PROB", "0.80")
+)
 OLLAMA_HOST = os.environ.get("OMNIVOICE_OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OMNIVOICE_OLLAMA_MODEL", "gemma4")
+CONVERSATION_WARMUP_ENABLED = os.environ.get(
+    "OMNIVOICE_CONVERSATION_WARMUP_ENABLED", "false"
+).lower() in ("true", "1", "yes")
 
 DTYPE_MAP = {
     "float16": torch.float16,
@@ -479,6 +485,32 @@ class ConversationService:
         self._voice_prompt_cache: dict[tuple[str, str | None], Any] = {}
         self._pending_turn_metrics: dict[str, dict[str, Any]] = {}
 
+    async def warmup(self, *, sample: str | None = None) -> None:
+        warmup_audio = b"\x00\x00" * (16000 // 4)
+        with contextlib.suppress(Exception):
+            await self.transcribe(
+                warmup_audio, 16000, session_id=None, language_hint=None
+            )
+        with contextlib.suppress(Exception):
+            await self._generate_assistant_text(
+                "Reply with ok.",
+                session_id="warmup",
+                history=[],
+                language_hint=None,
+            )
+        voice_clone_prompt = None
+        if sample:
+            with contextlib.suppress(Exception):
+                voice_clone_prompt = await self._get_voice_clone_prompt(sample)
+        with contextlib.suppress(Exception):
+            gen_kwargs: dict[str, Any] = {
+                "text": "Ok.",
+                "num_step": WS_DEFAULT_NUM_STEP,
+            }
+            if voice_clone_prompt is not None:
+                gen_kwargs["voice_clone_prompt"] = voice_clone_prompt
+            await self._generate_sentence_audio(gen_kwargs)
+
     async def transcribe(
         self,
         audio_bytes: bytes,
@@ -504,6 +536,9 @@ class ConversationService:
                 "turn_started_at": started,
                 "asr_ms": int((time.monotonic() - started) * 1000),
                 "detected_language": self._extract_detected_language(transcript),
+                "detected_language_probability": self._extract_detected_language_probability(
+                    transcript
+                ),
                 "language_hint": language_hint,
             }
         return transcript
@@ -705,6 +740,17 @@ class ConversationService:
             return None
         return language.strip()
 
+    def _extract_detected_language_probability(self, transcript: Any) -> float | None:
+        if isinstance(transcript, dict):
+            probability = transcript.get("language_probability") or transcript.get(
+                "detected_language_probability"
+            )
+        else:
+            probability = getattr(transcript, "language_probability", None)
+        if not isinstance(probability, (float, int)):
+            return None
+        return float(probability)
+
     def _assistant_backend_name(self) -> str:
         return type(self._assistant_backend).__name__
 
@@ -730,6 +776,9 @@ class ConversationService:
             "session_id": session_id,
             "response_id": response_id,
             "detected_language": turn_metrics.get("detected_language"),
+            "detected_language_probability": turn_metrics.get(
+                "detected_language_probability"
+            ),
             "language_hint": turn_metrics.get("language_hint"),
             "assistant_backend": self._assistant_backend_name(),
             "assistant_model": self._assistant_model_name(),
@@ -901,6 +950,10 @@ async def lifespan(application: FastAPI):
     if CONVERSATION_WS_ENABLED:
         log.info("Loading ASR model: %s", ASR_MODEL)
         conversation_service = _create_conversation_service()
+        if CONVERSATION_WARMUP_ENABLED:
+            warmup_sample = next(iter(sorted(voice_samples.keys())), None)
+            log.info("Warming up conversation stack")
+            await conversation_service.warmup(sample=warmup_sample)
 
     # Launch Gradio UI in a background thread, sharing the same model
     if GRADIO_ENABLED:
@@ -952,6 +1005,7 @@ if CONVERSATION_WS_ENABLED:
     app.include_router(
         create_conversation_router(
             service=conversation_service_proxy,
+            sticky_language_min_prob=ASR_LANGUAGE_STICKY_MIN_PROB,
             active_counter=_inc_active_ws,
         )
     )

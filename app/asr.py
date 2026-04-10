@@ -20,6 +20,7 @@ def _resolve_device(device: str) -> dict[str, Any]:
 class TranscriptionResult:
     text: str
     language: str | None = None
+    language_probability: float | None = None
 
 
 class FasterWhisperASR:
@@ -61,10 +62,18 @@ class FasterWhisperASR:
 
         segments, info = self._model.transcribe(audio, **kwargs)
         detected_language = getattr(info, "language", None)
+        detected_language_probability = getattr(info, "language_probability", None)
         if not isinstance(detected_language, str) or not detected_language.strip():
             detected_language = language_hint
+        if not isinstance(detected_language_probability, (float, int)):
+            detected_language_probability = None
 
         return TranscriptionResult(
             text="".join(segment.text for segment in segments).strip(),
             language=detected_language,
+            language_probability=(
+                float(detected_language_probability)
+                if detected_language_probability is not None
+                else None
+            ),
         )
