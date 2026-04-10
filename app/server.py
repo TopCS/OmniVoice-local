@@ -63,6 +63,7 @@ Environment variables:
 """
 
 import hmac
+import inspect
 import io
 import json
 import logging
@@ -74,7 +75,7 @@ import asyncio
 import contextlib
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -88,7 +89,11 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from conversation_ws import create_conversation_router
 from sentence_splitter import SentenceSplitter
+from text_sanitizer import sanitize_assistant_text
 from ws_handler import WSConfig, _generate_one, create_ws_router
+
+if TYPE_CHECKING:
+    from assistant_backends import AssistantBackend
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -463,43 +468,86 @@ class ConversationService:
         self,
         asr_adapter: Any,
         *,
-        assistant_client: Any,
-        assistant_model: str,
+        assistant_backend: "AssistantBackend",
     ):
         self._asr_adapter = asr_adapter
-        self._assistant_client = assistant_client
-        self._assistant_model = assistant_model
+        self._assistant_backend = assistant_backend
         self._splitter = SentenceSplitter(
             max_chars=WS_MAX_SENTENCE_CHARS,
             min_chars=max(1, WS_MIN_SENTENCE_CHARS),
         )
         self._voice_prompt_cache: dict[tuple[str, str | None], Any] = {}
+        self._pending_turn_metrics: dict[str, dict[str, Any]] = {}
 
-    async def transcribe(self, audio_bytes: bytes, sample_rate: int) -> str:
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        sample_rate: int,
+        *,
+        session_id: str | None = None,
+        language_hint: str | None = None,
+    ) -> Any:
         if sample_rate != 16000:
             raise RuntimeError(
                 "Conversation ASR currently expects mono 16 kHz PCM audio."
             )
-        return await asyncio.to_thread(self._asr_adapter.transcribe, audio_bytes)
+        started = time.monotonic()
+        transcript = await asyncio.to_thread(
+            _call_with_supported_kwargs,
+            self._asr_adapter.transcribe,
+            audio_bytes,
+            session_id=session_id,
+            language_hint=language_hint,
+        )
+        if session_id:
+            self._pending_turn_metrics[session_id] = {
+                "turn_started_at": started,
+                "asr_ms": int((time.monotonic() - started) * 1000),
+                "detected_language": self._extract_detected_language(transcript),
+                "language_hint": language_hint,
+            }
+        return transcript
 
     async def respond(
-        self, transcript: str, response_id: int, *, sample: str | None = None
+        self,
+        transcript: str,
+        response_id: int,
+        *,
+        sample: str | None = None,
+        session_id: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        language_hint: str | None = None,
     ):
         text = str(transcript).strip()
         if not text:
+            self._discard_pending_turn_metrics(session_id)
             yield {"type": "response_done", "response_id": response_id}
             return
 
-        response_text = (await self._generate_assistant_text(text)).strip()
+        turn_metrics = self._begin_turn_metrics(
+            session_id=session_id,
+            language_hint=language_hint,
+        )
+        llm_started = time.monotonic()
+        response_text = sanitize_assistant_text(
+            await self._generate_assistant_text(
+                text,
+                session_id=session_id,
+                history=history or [],
+                language_hint=language_hint,
+            )
+        )
+        llm_ms = int((time.monotonic() - llm_started) * 1000)
         if not response_text:
-            yield {"type": "response_done", "response_id": response_id}
-            return
+            raise RuntimeError("Assistant backend returned an empty response.")
 
         sentences = self._splitter.split_text(response_text)
         if not sentences:
             yield {"type": "response_done", "response_id": response_id}
             return
 
+        tts_started = time.monotonic()
+        tts_first_chunk_ms = None
         voice_clone_prompt = None
         if sample:
             voice_clone_prompt = await self._get_voice_clone_prompt(sample)
@@ -523,6 +571,8 @@ class ConversationService:
             audio = await self._generate_sentence_audio(gen_kwargs)
             generation_ms = int((time.monotonic() - started) * 1000)
             duration_ms = int(audio.shape[-1] * 1000 / SAMPLE_RATE)
+            if tts_first_chunk_ms is None:
+                tts_first_chunk_ms = int((time.monotonic() - tts_started) * 1000)
 
             yield {
                 "type": "audio_chunk",
@@ -537,6 +587,14 @@ class ConversationService:
                 ),
             }
 
+        self._log_completed_turn(
+            session_id=session_id,
+            response_id=response_id,
+            turn_metrics=turn_metrics,
+            llm_ms=llm_ms,
+            tts_first_chunk_ms=tts_first_chunk_ms,
+            tts_total_ms=int((time.monotonic() - tts_started) * 1000),
+        )
         yield {"type": "response_done", "response_id": response_id}
 
     def validate_sample(self, sample: str | None) -> None:
@@ -581,29 +639,147 @@ class ConversationService:
         self._voice_prompt_cache[cache_key] = prompt
         return prompt
 
-    async def _generate_assistant_text(self, transcript: str) -> str:
-        response = await self._assistant_client.chat(
-            model=self._assistant_model,
-            messages=[{"role": "user", "content": transcript}],
-            stream=False,
+    async def _generate_assistant_text(
+        self,
+        transcript: str,
+        *,
+        session_id: str | None,
+        history: list[dict[str, str]],
+        language_hint: str | None,
+    ) -> str:
+        generate_response = self._assistant_backend.generate_response
+        supports_context = _callable_supports_any_keyword(
+            generate_response,
+            {"session_id", "history", "language_hint"},
         )
-        return _extract_ollama_message_text(response)
+        if supports_context:
+            return await _call_with_supported_kwargs(
+                generate_response,
+                transcript,
+                session_id=session_id,
+                history=history,
+                language_hint=language_hint,
+            )
+
+        prompt = _build_assistant_prompt(
+            transcript,
+            session_id=session_id,
+            history=history,
+            language_hint=language_hint,
+        )
+        return await generate_response(prompt)
+
+    def _begin_turn_metrics(
+        self,
+        *,
+        session_id: str | None,
+        language_hint: str | None,
+    ) -> dict[str, Any]:
+        turn_metrics = {
+            "turn_started_at": time.monotonic(),
+            "asr_ms": None,
+            "detected_language": None,
+            "language_hint": language_hint,
+        }
+        if not session_id:
+            return turn_metrics
+
+        stored_metrics = self._pending_turn_metrics.pop(session_id, None)
+        if stored_metrics is None:
+            return turn_metrics
+
+        if language_hint is not None:
+            stored_metrics["language_hint"] = language_hint
+        return stored_metrics
+
+    def _discard_pending_turn_metrics(self, session_id: str | None) -> None:
+        if session_id:
+            self._pending_turn_metrics.pop(session_id, None)
+
+    def _extract_detected_language(self, transcript: Any) -> str | None:
+        if isinstance(transcript, dict):
+            language = transcript.get("language") or transcript.get("detected_language")
+        else:
+            language = getattr(transcript, "language", None)
+        if not isinstance(language, str) or not language.strip():
+            return None
+        return language.strip()
+
+    def _assistant_backend_name(self) -> str:
+        return type(self._assistant_backend).__name__
+
+    def _assistant_model_name(self) -> str | None:
+        for attribute_name in ("_model", "model"):
+            value = getattr(self._assistant_backend, attribute_name, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _log_completed_turn(
+        self,
+        *,
+        session_id: str | None,
+        response_id: int,
+        turn_metrics: dict[str, Any],
+        llm_ms: int,
+        tts_first_chunk_ms: int | None,
+        tts_total_ms: int,
+    ) -> None:
+        payload = {
+            "event": "conversation_turn_completed",
+            "session_id": session_id,
+            "response_id": response_id,
+            "detected_language": turn_metrics.get("detected_language"),
+            "language_hint": turn_metrics.get("language_hint"),
+            "assistant_backend": self._assistant_backend_name(),
+            "assistant_model": self._assistant_model_name(),
+            "asr_ms": turn_metrics.get("asr_ms"),
+            "llm_ms": llm_ms,
+            "tts_first_chunk_ms": tts_first_chunk_ms,
+            "tts_total_ms": tts_total_ms,
+            "turn_total_ms": int(
+                (time.monotonic() - turn_metrics["turn_started_at"]) * 1000
+            ),
+        }
+        log.info(json.dumps(payload, sort_keys=True))
 
 
 class _ConversationServiceProxy:
-    async def transcribe(self, audio_bytes: bytes, sample_rate: int) -> str:
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        sample_rate: int,
+        *,
+        session_id: str | None = None,
+        language_hint: str | None = None,
+    ) -> Any:
         return await _require_conversation_service().transcribe(
-            audio_bytes, sample_rate
+            audio_bytes,
+            sample_rate,
+            session_id=session_id,
+            language_hint=language_hint,
         )
 
     def validate_sample(self, sample: str | None) -> None:
         _require_conversation_service().validate_sample(sample)
 
     async def respond(
-        self, transcript: str, response_id: int, *, sample: str | None = None
+        self,
+        transcript: str,
+        response_id: int,
+        *,
+        sample: str | None = None,
+        session_id: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        language_hint: str | None = None,
     ):
         async for event in _require_conversation_service().respond(
-            transcript, response_id, sample=sample
+            transcript,
+            response_id,
+            sample=sample,
+            session_id=session_id,
+            history=history,
+            language_hint=language_hint,
         ):
             yield event
 
@@ -615,6 +791,7 @@ def _require_conversation_service() -> ConversationService:
 
 
 def _create_conversation_service() -> ConversationService:
+    from assistant_backends import OllamaAssistantBackend
     from asr import FasterWhisperASR
     from ollama import AsyncClient
 
@@ -624,29 +801,61 @@ def _create_conversation_service() -> ConversationService:
             device=ASR_DEVICE,
             compute_type=ASR_COMPUTE_TYPE,
         ),
-        assistant_client=AsyncClient(host=OLLAMA_HOST),
-        assistant_model=OLLAMA_MODEL,
+        assistant_backend=OllamaAssistantBackend(
+            AsyncClient(host=OLLAMA_HOST), OLLAMA_MODEL
+        ),
     )
 
 
 conversation_service_proxy = _ConversationServiceProxy()
 
 
-def _extract_ollama_message_text(response: Any) -> str:
-    if isinstance(response, dict):
-        message = response.get("message")
-        if isinstance(message, dict):
-            return str(message.get("content") or "")
-        return ""
+def _callable_supports_any_keyword(func: Any, names: set[str]) -> bool:
+    parameters = inspect.signature(func).parameters.values()
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name in names
+        for parameter in parameters
+    )
 
-    message = getattr(response, "message", None)
-    if message is None:
-        return ""
 
-    content = getattr(message, "content", None)
-    if content is None and hasattr(message, "get"):
-        content = message.get("content")
-    return str(content or "")
+def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
+    parameters = inspect.signature(func).parameters.values()
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return func(*args, **kwargs)
+
+    supported_names = {parameter.name for parameter in parameters}
+    supported_kwargs = {
+        name: value for name, value in kwargs.items() if name in supported_names
+    }
+    return func(*args, **supported_kwargs)
+
+
+def _build_assistant_prompt(
+    transcript: str,
+    *,
+    session_id: str | None,
+    history: list[dict[str, str]],
+    language_hint: str | None,
+) -> str:
+    if not history and not language_hint and not session_id:
+        return transcript
+
+    lines = ["Continue the phone conversation naturally."]
+    if session_id:
+        lines.append(f"Session ID: {session_id}")
+    if language_hint:
+        lines.append(f"Caller language hint: {language_hint}")
+    if history:
+        lines.append("Recent conversation:")
+        for turn in history[-3:]:
+            user_text = str(turn.get("user") or "").strip()
+            assistant_text = str(turn.get("assistant") or "").strip()
+            if user_text:
+                lines.append(f"Caller: {user_text}")
+            if assistant_text:
+                lines.append(f"Assistant: {assistant_text}")
+    lines.append(f"Caller: {transcript}")
+    return "\n".join(lines)
 
 
 def _inc_active_ws(delta: int) -> None:

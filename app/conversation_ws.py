@@ -8,6 +8,7 @@ import binascii
 import contextlib
 import inspect
 import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -20,9 +21,13 @@ DEFAULT_MAX_INPUT_BYTES = 1024 * 1024
 
 @dataclass
 class ConversationSessionState:
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     started: bool = False
     sample: str | None = None
     sample_rate: int = SUPPORTED_SAMPLE_RATE
+    language_override: str | None = None
+    last_detected_language: str | None = None
+    history: list[dict[str, str]] = field(default_factory=list)
     collecting: bool = False
     audio_chunks: list[bytes] = field(default_factory=list)
     buffered_audio_bytes: int = 0
@@ -123,6 +128,16 @@ async def _handle_event(
     msg_type = message.get("type")
     if msg_type == "session_start":
         sample = str(message["sample"]) if message.get("sample") else None
+        language = message.get("language")
+        if language is not None:
+            if not isinstance(language, str) or not language.strip():
+                await _send_error(
+                    websocket,
+                    "Field 'language' must be a non-empty string.",
+                    "INVALID_MESSAGE",
+                )
+                return
+            language = language.strip()
         if message.get("sample_rate") is not None:
             try:
                 sample_rate = int(message["sample_rate"])
@@ -156,16 +171,19 @@ async def _handle_event(
             await _send_error(websocket, str(exc), "INVALID_MESSAGE")
             return
 
+        await _reset_session_state(websocket, state)
         state.started = True
         state.sample = sample
         state.sample_rate = sample_rate
-        await websocket.send_json(
-            {
-                "type": "session_started",
-                "sample": state.sample,
-                "sample_rate": state.sample_rate,
-            }
-        )
+        state.language_override = language
+        payload = {
+            "type": "session_started",
+            "sample": state.sample,
+            "sample_rate": state.sample_rate,
+        }
+        if state.language_override is not None:
+            payload["language"] = state.language_override
+        await websocket.send_json(payload)
         return
 
     if not state.started:
@@ -207,22 +225,35 @@ async def _handle_event(
         state.buffered_audio_bytes = 0
 
         try:
-            transcript = await service.transcribe(audio_bytes, state.sample_rate)
+            transcript_result = await _call_service_transcribe(
+                service,
+                audio_bytes,
+                state.sample_rate,
+                session_id=state.session_id,
+                language_hint=state.language_override,
+            )
         except Exception as exc:  # noqa: BLE001
             await _send_error(websocket, str(exc), "TRANSCRIBE_ERROR")
             return
 
-        if isinstance(transcript, dict):
-            await websocket.send_json(transcript)
-        else:
-            await websocket.send_json({"type": "transcript_final", "text": transcript})
+        transcript, detected_language, transcript_payload = (
+            _normalize_transcript_result(transcript_result)
+        )
+        if detected_language is not None:
+            state.last_detected_language = detected_language
+
+        await websocket.send_json(transcript_payload)
 
         response_id = state.next_response_id
         state.next_response_id += 1
         state.active_response_id = response_id
         state.response_task = asyncio.create_task(
             _forward_service_response(
-                websocket, state, service, transcript, response_id
+                websocket,
+                state,
+                service,
+                transcript,
+                response_id,
             )
         )
         state.background_response_tasks.add(state.response_task)
@@ -307,19 +338,35 @@ async def _forward_service_response(
     transcript: Any,
     response_id: int,
 ) -> None:
+    assistant_chunks: list[str] = []
     try:
         async for event in _iterate_response_events(
-            _call_service_respond(service, transcript, response_id, state.sample)
+            _call_service_respond(
+                service,
+                transcript,
+                response_id,
+                sample=state.sample,
+                session_id=state.session_id,
+                history=list(state.history),
+                language_hint=_current_language_hint(state),
+            )
         ):
             if _response_is_stale(state, response_id):
                 break
             payload = _normalize_response_event(event, response_id)
+            if payload.get("type") == "assistant_text":
+                assistant_text = payload.get("text")
+                if isinstance(assistant_text, str) and assistant_text.strip():
+                    assistant_chunks.append(assistant_text.strip())
             binary = payload.pop("payload", None)
             await websocket.send_json(payload)
             if binary is not None:
                 await websocket.send_bytes(binary)
             if _response_is_stale(state, response_id):
                 break
+        else:
+            if not _response_is_stale(state, response_id):
+                _append_history_entry(state, transcript, " ".join(assistant_chunks))
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -386,6 +433,19 @@ async def _cancel_active_response(state: ConversationSessionState) -> None:
             await asyncio.gather(*tasks)
 
 
+async def _reset_session_state(
+    websocket: WebSocket, state: ConversationSessionState
+) -> None:
+    await _interrupt_active_response(websocket, state)
+    state.session_id = uuid.uuid4().hex
+    state.last_detected_language = None
+    state.history.clear()
+    state.collecting = False
+    state.audio_chunks.clear()
+    state.buffered_audio_bytes = 0
+    state.cancelled_response_ids.clear()
+
+
 def _response_is_stale(state: ConversationSessionState, response_id: int) -> bool:
     return (
         response_id in state.cancelled_response_ids
@@ -402,13 +462,44 @@ def _cleanup_response_task(
 
 
 def _call_service_respond(
-    service: Any, transcript: Any, response_id: int, sample: str | None
+    service: Any,
+    transcript: str,
+    response_id: int,
+    *,
+    sample: str | None,
+    session_id: str,
+    history: list[dict[str, str]],
+    language_hint: str | None,
 ):
-    respond = service.respond
-    parameters = inspect.signature(respond).parameters
-    if "sample" in parameters:
-        return respond(transcript, response_id, sample=sample)
-    return respond(transcript, response_id)
+    return _call_with_supported_kwargs(
+        service.respond,
+        transcript,
+        response_id,
+        sample=sample,
+        session_id=session_id,
+        history=history,
+        language_hint=language_hint,
+    )
+
+
+async def _call_service_transcribe(
+    service: Any,
+    audio_bytes: bytes,
+    sample_rate: int,
+    *,
+    session_id: str,
+    language_hint: str | None,
+) -> Any:
+    result = _call_with_supported_kwargs(
+        service.transcribe,
+        audio_bytes,
+        sample_rate,
+        session_id=session_id,
+        language_hint=language_hint,
+    )
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
 
 
 async def _validate_sample(service: Any, sample: str | None) -> None:
@@ -428,6 +519,58 @@ def _normalize_response_event(event: Any, response_id: int) -> dict[str, Any]:
     else:
         payload.setdefault("response_id", response_id)
     return payload
+
+
+def _normalize_transcript_result(
+    transcript: Any,
+) -> tuple[str, str | None, dict[str, Any]]:
+    if isinstance(transcript, dict):
+        text = str(transcript.get("text") or "").strip()
+        language = transcript.get("language")
+        if not isinstance(language, str) or not language.strip():
+            language = transcript.get("detected_language")
+        if not isinstance(language, str) or not language.strip():
+            language = None
+
+        payload = dict(transcript)
+        payload.setdefault("type", "transcript_final")
+        payload["text"] = text
+        return text, language, payload
+
+    text = getattr(transcript, "text", transcript)
+    language = getattr(transcript, "language", None)
+    text = str(text or "").strip()
+    if not isinstance(language, str) or not language.strip():
+        language = None
+    return text, language, {"type": "transcript_final", "text": text}
+
+
+def _current_language_hint(state: ConversationSessionState) -> str | None:
+    return state.language_override or state.last_detected_language
+
+
+def _append_history_entry(
+    state: ConversationSessionState, transcript: str, assistant_text: str
+) -> None:
+    transcript_text = transcript.strip()
+    response_text = assistant_text.strip()
+    if not transcript_text or not response_text:
+        return
+
+    state.history.append({"user": transcript_text, "assistant": response_text})
+    state.history[:] = state.history[-3:]
+
+
+def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
+    parameters = inspect.signature(func).parameters.values()
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return func(*args, **kwargs)
+
+    supported_names = {parameter.name for parameter in parameters}
+    supported_kwargs = {
+        name: value for name, value in kwargs.items() if name in supported_names
+    }
+    return func(*args, **supported_kwargs)
 
 
 async def _send_error(websocket: WebSocket, message: str, code: str) -> None:

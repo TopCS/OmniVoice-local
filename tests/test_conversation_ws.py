@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import asyncio
 import base64
+import json
 import sys
 import threading
 import types
@@ -39,17 +40,46 @@ def _load_app_module(module_name: str, filename: str):
 class FakeConversationService:
     def __init__(self):
         self.transcribe_calls = []
+        self.transcribe_contexts = []
+        self.transcript_results = []
         self.response_started = []
+        self.response_contexts = []
         self.response_released = {}
 
-    async def transcribe(self, audio_bytes: bytes, sample_rate: int) -> str:
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        sample_rate: int,
+        *,
+        session_id: str | None = None,
+        language_hint: str | None = None,
+    ):
         self.transcribe_calls.append((audio_bytes, sample_rate))
+        self.transcribe_contexts.append(
+            {"session_id": session_id, "language_hint": language_hint}
+        )
+        if self.transcript_results:
+            return self.transcript_results.pop(0)
         return "hello there"
 
     async def respond(
-        self, transcript: str, response_id: int, *, sample: str | None = None
+        self,
+        transcript: str,
+        response_id: int,
+        *,
+        sample: str | None = None,
+        session_id: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        language_hint: str | None = None,
     ):
         self.response_started.append((transcript, response_id, sample))
+        self.response_contexts.append(
+            {
+                "session_id": session_id,
+                "history": history,
+                "language_hint": language_hint,
+            }
+        )
         yield {"type": "assistant_text", "text": f"answering {transcript}"}
 
         gate = self.response_released.setdefault(
@@ -63,6 +93,22 @@ class FakeConversationService:
             "payload": b"audio-bytes",
         }
         yield {"type": "response_done", "response_id": response_id}
+
+
+class FakeAssistantBackend:
+    def __init__(self, response_text: str = ""):
+        self.response_text = response_text
+        self.calls = []
+
+    async def generate_response(self, transcript: str) -> str:
+        self.calls.append(transcript)
+        return self.response_text
+
+
+class FakeTranscriptionResult:
+    def __init__(self, text: str, language: str | None = None):
+        self.text = text
+        self.language = language
 
 
 def _make_client(*, max_input_bytes: int = 1024 * 1024):
@@ -97,7 +143,9 @@ def test_faster_whisper_asr_adapter_transcribes_pcm_bytes(monkeypatch):
                 def __init__(self, text):
                     self.text = text
 
-            return iter([Segment(" hello"), Segment(" world")]), object()
+            return iter([Segment(" hello"), Segment(" world")]), types.SimpleNamespace(
+                language="fr"
+            )
 
     monkeypatch.setitem(
         sys.modules,
@@ -113,15 +161,17 @@ def test_faster_whisper_asr_adapter_transcribes_pcm_bytes(monkeypatch):
     )
 
     transcript = adapter.transcribe(
-        np.array([0, 32767, -32768], dtype=np.int16).tobytes()
+        np.array([0, 32767, -32768], dtype=np.int16).tobytes(),
+        language_hint="es",
     )
 
-    assert transcript == "hello world"
+    assert transcript.text == "hello world"
+    assert transcript.language == "fr"
     assert model_calls["init"] == (
         "small",
         {"device": "cuda", "device_index": 1, "compute_type": "int8_float16"},
     )
-    assert model_calls["transcribe_kwargs"] == {"beam_size": 1}
+    assert model_calls["transcribe_kwargs"] == {"beam_size": 1, "language": "es"}
     assert model_calls["audio"].tolist() == pytest.approx([0.0, 32767 / 32768, -1.0])
 
 
@@ -131,17 +181,358 @@ async def test_server_conversation_service_requires_16khz_audio(monkeypatch):
         def transcribe(self, pcm_bytes: bytes) -> str:
             return f"heard {len(pcm_bytes)} bytes"
 
-    class FakeOllamaClient:
-        def chat(self, **kwargs):
-            raise AssertionError(f"chat should not be called: {kwargs}")
-
     server = _load_server_module(monkeypatch, conversation_enabled=True)
     service = server.ConversationService(
-        FakeASR(), assistant_client=FakeOllamaClient(), assistant_model="gemma4"
+        FakeASR(), assistant_backend=FakeAssistantBackend()
     )
 
     with pytest.raises(RuntimeError, match="16 kHz PCM"):
         await service.transcribe(b"abc", 8000)
+
+
+@pytest.mark.asyncio
+async def test_server_conversation_service_passes_language_hint_to_asr(monkeypatch):
+    asr_calls = []
+
+    class FakeASR:
+        def transcribe(
+            self,
+            pcm_bytes: bytes,
+            *,
+            language_hint: str | None = None,
+            session_id: str | None = None,
+        ):
+            asr_calls.append(
+                {
+                    "pcm_bytes": pcm_bytes,
+                    "language_hint": language_hint,
+                    "session_id": session_id,
+                }
+            )
+            return FakeTranscriptionResult("heard caller", language="es")
+
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+    service = server.ConversationService(
+        FakeASR(), assistant_backend=FakeAssistantBackend()
+    )
+
+    result = await service.transcribe(
+        b"abc",
+        16000,
+        session_id="session-123",
+        language_hint="fr",
+    )
+
+    assert result.text == "heard caller"
+    assert result.language == "es"
+    assert asr_calls == [
+        {
+            "pcm_bytes": b"abc",
+            "language_hint": "fr",
+            "session_id": "session-123",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_server_conversation_service_passes_session_context_to_backend(
+    monkeypatch,
+):
+    backend_calls = []
+
+    class FakeASR:
+        def transcribe(self, pcm_bytes: bytes) -> str:
+            raise AssertionError(f"transcribe should not be called: {pcm_bytes!r}")
+
+    class ContextAwareBackend:
+        async def generate_response(
+            self,
+            transcript: str,
+            *,
+            session_id: str | None = None,
+            history: list[dict[str, str]] | None = None,
+            language_hint: str | None = None,
+        ) -> str:
+            backend_calls.append(
+                {
+                    "transcript": transcript,
+                    "session_id": session_id,
+                    "history": history,
+                    "language_hint": language_hint,
+                }
+            )
+            return "Assistant sentence."
+
+    class FakeAudio:
+        shape = (1, 2400)
+
+    async def fake_generate_sentence_audio(gen_kwargs):
+        del gen_kwargs
+        return FakeAudio()
+
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+    service = server.ConversationService(
+        FakeASR(), assistant_backend=ContextAwareBackend()
+    )
+    monkeypatch.setattr(
+        service, "_generate_sentence_audio", fake_generate_sentence_audio
+    )
+    monkeypatch.setattr(server, "encode_audio_chunk", lambda *args, **kwargs: b"pcm")
+
+    events = [
+        event
+        async for event in service.respond(
+            "Current caller message",
+            5,
+            session_id="session-123",
+            history=[
+                {"user": "First caller turn", "assistant": "First assistant reply"},
+                {"user": "Second caller turn", "assistant": "Second assistant reply"},
+            ],
+            language_hint="de",
+        )
+    ]
+
+    assert backend_calls == [
+        {
+            "transcript": "Current caller message",
+            "session_id": "session-123",
+            "history": [
+                {"user": "First caller turn", "assistant": "First assistant reply"},
+                {"user": "Second caller turn", "assistant": "Second assistant reply"},
+            ],
+            "language_hint": "de",
+        }
+    ]
+    assert events == [
+        {"type": "assistant_text", "text": "Assistant sentence.", "response_id": 5},
+        {
+            "type": "audio_chunk",
+            "response_id": 5,
+            "chunk_index": 0,
+            "sentence": "Assistant sentence.",
+            "duration_ms": 100,
+            "generation_time_ms": events[1]["generation_time_ms"],
+            "is_last": True,
+            "payload": b"pcm",
+        },
+        {"type": "response_done", "response_id": 5},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_server_conversation_service_logs_completed_turn_metrics(
+    monkeypatch, caplog
+):
+    class FakeASR:
+        def transcribe(
+            self,
+            pcm_bytes: bytes,
+            *,
+            language_hint: str | None = None,
+            session_id: str | None = None,
+        ):
+            assert pcm_bytes == b"abc"
+            assert language_hint == "fr"
+            assert session_id == "session-123"
+            return FakeTranscriptionResult("heard caller", language="es")
+
+    class FakeAudio:
+        shape = (1, 2400)
+
+    async def fake_generate_sentence_audio(gen_kwargs):
+        assert gen_kwargs["text"] == "Assistant sentence."
+        return FakeAudio()
+
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+    assistant_backend = FakeAssistantBackend("Assistant sentence.")
+    assistant_backend._model = "test-model"
+    service = server.ConversationService(FakeASR(), assistant_backend=assistant_backend)
+    monkeypatch.setattr(
+        service, "_generate_sentence_audio", fake_generate_sentence_audio
+    )
+    monkeypatch.setattr(server, "encode_audio_chunk", lambda *args, **kwargs: b"pcm")
+    caplog.set_level("INFO", logger="omnivoice-server")
+
+    transcript = await service.transcribe(
+        b"abc",
+        16000,
+        session_id="session-123",
+        language_hint="fr",
+    )
+    events = [
+        event
+        async for event in service.respond(
+            transcript.text,
+            6,
+            session_id="session-123",
+            history=[],
+            language_hint="fr",
+        )
+    ]
+
+    assert events == [
+        {"type": "assistant_text", "text": "Assistant sentence.", "response_id": 6},
+        {
+            "type": "audio_chunk",
+            "response_id": 6,
+            "chunk_index": 0,
+            "sentence": "Assistant sentence.",
+            "duration_ms": 100,
+            "generation_time_ms": events[1]["generation_time_ms"],
+            "is_last": True,
+            "payload": b"pcm",
+        },
+        {"type": "response_done", "response_id": 6},
+    ]
+
+    log_payloads = []
+    for record in caplog.records:
+        try:
+            log_payloads.append(json.loads(record.message))
+        except json.JSONDecodeError:
+            continue
+
+    completed_turn_logs = [
+        payload
+        for payload in log_payloads
+        if payload.get("event") == "conversation_turn_completed"
+    ]
+
+    assert len(completed_turn_logs) == 1
+    assert completed_turn_logs[0] == {
+        "event": "conversation_turn_completed",
+        "session_id": "session-123",
+        "response_id": 6,
+        "detected_language": "es",
+        "language_hint": "fr",
+        "assistant_backend": "FakeAssistantBackend",
+        "assistant_model": "test-model",
+        "asr_ms": completed_turn_logs[0]["asr_ms"],
+        "llm_ms": completed_turn_logs[0]["llm_ms"],
+        "tts_first_chunk_ms": completed_turn_logs[0]["tts_first_chunk_ms"],
+        "tts_total_ms": completed_turn_logs[0]["tts_total_ms"],
+        "turn_total_ms": completed_turn_logs[0]["turn_total_ms"],
+    }
+    assert completed_turn_logs[0]["asr_ms"] >= 0
+    assert completed_turn_logs[0]["llm_ms"] >= 0
+    assert completed_turn_logs[0]["tts_first_chunk_ms"] >= 0
+    assert (
+        completed_turn_logs[0]["tts_total_ms"]
+        >= completed_turn_logs[0]["tts_first_chunk_ms"]
+    )
+    assert (
+        completed_turn_logs[0]["turn_total_ms"]
+        >= completed_turn_logs[0]["tts_total_ms"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_server_conversation_service_clears_empty_turn_metrics_before_next_log(
+    monkeypatch, caplog
+):
+    class FakeASR:
+        def transcribe(
+            self,
+            pcm_bytes: bytes,
+            *,
+            language_hint: str | None = None,
+            session_id: str | None = None,
+        ):
+            assert pcm_bytes == b"abc"
+            assert language_hint == "it"
+            assert session_id == "session-123"
+            return FakeTranscriptionResult("   ", language="it")
+
+    class FakeAudio:
+        shape = (1, 2400)
+
+    async def fake_generate_sentence_audio(gen_kwargs):
+        assert gen_kwargs["text"] == "Assistant sentence."
+        return FakeAudio()
+
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+    assistant_backend = FakeAssistantBackend("Assistant sentence.")
+    assistant_backend._model = "test-model"
+    service = server.ConversationService(FakeASR(), assistant_backend=assistant_backend)
+    monkeypatch.setattr(
+        service, "_generate_sentence_audio", fake_generate_sentence_audio
+    )
+    monkeypatch.setattr(server, "encode_audio_chunk", lambda *args, **kwargs: b"pcm")
+    caplog.set_level("INFO", logger="omnivoice-server")
+
+    transcript = await service.transcribe(
+        b"abc",
+        16000,
+        session_id="session-123",
+        language_hint="it",
+    )
+    empty_turn_events = [
+        event
+        async for event in service.respond(
+            transcript.text,
+            1,
+            session_id="session-123",
+            history=[],
+            language_hint="it",
+        )
+    ]
+    non_empty_turn_events = [
+        event
+        async for event in service.respond(
+            "Actual caller transcript",
+            2,
+            session_id="session-123",
+            history=[],
+            language_hint="fr",
+        )
+    ]
+
+    assert empty_turn_events == [{"type": "response_done", "response_id": 1}]
+    assert non_empty_turn_events == [
+        {"type": "assistant_text", "text": "Assistant sentence.", "response_id": 2},
+        {
+            "type": "audio_chunk",
+            "response_id": 2,
+            "chunk_index": 0,
+            "sentence": "Assistant sentence.",
+            "duration_ms": 100,
+            "generation_time_ms": non_empty_turn_events[1]["generation_time_ms"],
+            "is_last": True,
+            "payload": b"pcm",
+        },
+        {"type": "response_done", "response_id": 2},
+    ]
+
+    log_payloads = []
+    for record in caplog.records:
+        try:
+            log_payloads.append(json.loads(record.message))
+        except json.JSONDecodeError:
+            continue
+
+    completed_turn_logs = [
+        payload
+        for payload in log_payloads
+        if payload.get("event") == "conversation_turn_completed"
+    ]
+
+    assert completed_turn_logs == [
+        {
+            "event": "conversation_turn_completed",
+            "session_id": "session-123",
+            "response_id": 2,
+            "detected_language": None,
+            "language_hint": "fr",
+            "assistant_backend": "FakeAssistantBackend",
+            "assistant_model": "test-model",
+            "asr_ms": None,
+            "llm_ms": completed_turn_logs[0]["llm_ms"],
+            "tts_first_chunk_ms": completed_turn_logs[0]["tts_first_chunk_ms"],
+            "tts_total_ms": completed_turn_logs[0]["tts_total_ms"],
+            "turn_total_ms": completed_turn_logs[0]["turn_total_ms"],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -163,20 +554,10 @@ async def test_server_conversation_service_streams_response_scoped_text_and_audi
             self.prompt_calls.append(kwargs)
             return {"cached": True, **kwargs}
 
-    class FakeOllamaClient:
-        def __init__(self):
-            self.chat_calls = []
-
-        async def chat(self, **kwargs):
-            self.chat_calls.append(kwargs)
-            return {
-                "message": {
-                    "content": "Assistant first sentence. Assistant second sentence?"
-                }
-            }
-
     generated_kwargs = []
-    assistant_client = FakeOllamaClient()
+    assistant_backend = FakeAssistantBackend(
+        "Assistant first sentence. Assistant second sentence?"
+    )
     server = _load_server_module(monkeypatch, conversation_enabled=True)
     server.model = FakeModel()
     server.voice_samples = {
@@ -200,8 +581,7 @@ async def test_server_conversation_service_streams_response_scoped_text_and_audi
 
     service = server.ConversationService(
         FakeASR(),
-        assistant_client=assistant_client,
-        assistant_model="local-assistant",
+        assistant_backend=assistant_backend,
     )
 
     events = [
@@ -266,20 +646,86 @@ async def test_server_conversation_service_streams_response_scoped_text_and_audi
             },
         },
     ]
-    assert assistant_client.chat_calls == [
-        {
-            "model": "local-assistant",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Caller transcript that should not be echoed.",
-                }
-            ],
-            "stream": False,
-        }
-    ]
+    assert assistant_backend.calls == ["Caller transcript that should not be echoed."]
     assert server.model.prompt_calls == [
         {"ref_audio": "/tmp/agent.wav", "ref_text": "hello"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_server_conversation_service_sanitizes_assistant_output_before_tts(
+    monkeypatch,
+):
+    class FakeASR:
+        def transcribe(self, pcm_bytes: bytes) -> str:
+            raise AssertionError("transcribe should not be called")
+
+    class FakeAudio:
+        shape = (1, 2400)
+
+    generated_texts = []
+    assistant_backend = FakeAssistantBackend(
+        '```json\n{"reply":"# Update\\n- Your order ships tomorrow!!!\\n- Tracking number follows."}\n```'
+    )
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+
+    async def fake_generate_sentence_audio(gen_kwargs):
+        generated_texts.append(gen_kwargs["text"])
+        return FakeAudio()
+
+    service = server.ConversationService(
+        FakeASR(),
+        assistant_backend=assistant_backend,
+    )
+    monkeypatch.setattr(
+        service, "_generate_sentence_audio", fake_generate_sentence_audio
+    )
+    monkeypatch.setattr(server, "encode_audio_chunk", lambda *args, **kwargs: b"pcm")
+
+    events = [
+        event
+        async for event in service.respond(
+            "Caller transcript that should not be echoed.",
+            8,
+        )
+    ]
+
+    assert events == [
+        {
+            "type": "assistant_text",
+            "text": "Update Your order ships tomorrow!",
+            "response_id": 8,
+        },
+        {
+            "type": "audio_chunk",
+            "response_id": 8,
+            "chunk_index": 0,
+            "sentence": "Update Your order ships tomorrow!",
+            "duration_ms": 100,
+            "generation_time_ms": events[1]["generation_time_ms"],
+            "is_last": False,
+            "payload": b"pcm",
+        },
+        {
+            "type": "assistant_text",
+            "text": "Tracking number follows.",
+            "response_id": 8,
+        },
+        {
+            "type": "audio_chunk",
+            "response_id": 8,
+            "chunk_index": 1,
+            "sentence": "Tracking number follows.",
+            "duration_ms": 100,
+            "generation_time_ms": events[3]["generation_time_ms"],
+            "is_last": True,
+            "payload": b"pcm",
+        },
+        {"type": "response_done", "response_id": 8},
+    ]
+    assert generated_texts == [
+        "Update Your order ships tomorrow!",
+        "Tracking number follows.",
     ]
 
 
@@ -316,11 +762,21 @@ def test_server_conversation_service_uses_configured_ollama_host_and_model(
     monkeypatch,
 ):
     client_init = []
+    backend_init = []
     asr_init = []
 
     class FakeAsyncClient:
         def __init__(self, host):
             client_init.append(host)
+
+    class FakeAssistantBackendImpl:
+        def __init__(self, client, model):
+            backend_init.append((client, model))
+
+        async def generate_response(self, transcript: str) -> str:
+            raise AssertionError(
+                f"generate_response should not be called: {transcript}"
+            )
 
     class FakeASR:
         def __init__(self, model_name, device, compute_type):
@@ -330,6 +786,11 @@ def test_server_conversation_service_uses_configured_ollama_host_and_model(
     monkeypatch.setenv("OMNIVOICE_OLLAMA_MODEL", "custom-gemma")
     monkeypatch.setitem(
         sys.modules, "ollama", types.SimpleNamespace(AsyncClient=FakeAsyncClient)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "assistant_backends",
+        types.SimpleNamespace(OllamaAssistantBackend=FakeAssistantBackendImpl),
     )
 
     server = _load_server_module(monkeypatch, conversation_enabled=True)
@@ -341,7 +802,172 @@ def test_server_conversation_service_uses_configured_ollama_host_and_model(
 
     assert client_init == ["http://ollama.internal:11434"]
     assert asr_init == [("tiny.en", "cpu", "int8")]
-    assert service._assistant_model == "custom-gemma"
+    assert len(backend_init) == 1
+    assert backend_init[0][0].__class__ is FakeAsyncClient
+    assert backend_init[0][1] == "custom-gemma"
+    assert isinstance(service._assistant_backend, FakeAssistantBackendImpl)
+
+
+@pytest.mark.asyncio
+async def test_ollama_assistant_backend_enforces_phone_agent_plain_text_policy():
+    chat_calls = []
+
+    class FakeAsyncClient:
+        async def chat(self, **kwargs):
+            chat_calls.append(kwargs)
+            return {"message": {"content": "I can help with that now."}}
+
+    assistant_backends = _load_app_module(
+        "assistant_backends_under_test", "assistant_backends.py"
+    )
+    backend = assistant_backends.OllamaAssistantBackend(
+        FakeAsyncClient(), "phone-agent-model"
+    )
+
+    reply = await backend.generate_response("I need to reschedule my appointment.")
+
+    assert reply == "I can help with that now."
+    assert len(chat_calls) == 1
+    assert chat_calls[0]["model"] == "phone-agent-model"
+    assert chat_calls[0]["stream"] is False
+    assert chat_calls[0]["messages"][1] == {
+        "role": "user",
+        "content": "I need to reschedule my appointment.",
+    }
+    system_prompt = chat_calls[0]["messages"][0]["content"]
+    assert chat_calls[0]["messages"][0]["role"] == "system"
+    assert "phone" in system_prompt.lower()
+    assert "calm" in system_prompt.lower()
+    assert "direct" in system_prompt.lower()
+    assert "reassuring" in system_prompt.lower()
+    assert "plain text" in system_prompt.lower()
+    assert "markdown" in system_prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_ollama_assistant_backend_uses_structured_context_messages():
+    chat_calls = []
+
+    class FakeAsyncClient:
+        async def chat(self, **kwargs):
+            chat_calls.append(kwargs)
+            return {"message": {"content": "I can help with that now."}}
+
+    assistant_backends = _load_app_module(
+        "assistant_backends_context_under_test", "assistant_backends.py"
+    )
+    backend = assistant_backends.OllamaAssistantBackend(
+        FakeAsyncClient(), "phone-agent-model"
+    )
+
+    reply = await backend.generate_response(
+        "Current caller message",
+        session_id="session-123",
+        history=[
+            {"user": "First caller turn", "assistant": "First assistant reply"},
+            {"user": "Second caller turn", "assistant": "Second assistant reply"},
+        ],
+        language_hint="de",
+    )
+
+    assert reply == "I can help with that now."
+    assert chat_calls == [
+        {
+            "model": "phone-agent-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": assistant_backends.PHONE_AGENT_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "system",
+                    "content": "Conversation context: session_id=session-123; caller_language_hint=de.",
+                },
+                {"role": "user", "content": "First caller turn"},
+                {"role": "assistant", "content": "First assistant reply"},
+                {"role": "user", "content": "Second caller turn"},
+                {"role": "assistant", "content": "Second assistant reply"},
+                {"role": "user", "content": "Current caller message"},
+            ],
+            "stream": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"message": {}},
+        {"message": {"content": None}},
+        {"message": {"content": ["not", "text"]}},
+    ],
+)
+async def test_ollama_assistant_backend_raises_for_malformed_response(response):
+    class FakeAsyncClient:
+        async def chat(self, **kwargs):
+            del kwargs
+            return response
+
+    assistant_backends = _load_app_module(
+        "assistant_backends_malformed_under_test", "assistant_backends.py"
+    )
+    backend = assistant_backends.OllamaAssistantBackend(
+        FakeAsyncClient(), "phone-agent-model"
+    )
+
+    with pytest.raises(
+        RuntimeError, match="Assistant backend returned no usable message content"
+    ):
+        await backend.generate_response("Please help me with my order.")
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "expected"),
+    [
+        (
+            '```json\n{"reply":"# Update\\n- Your order ships tomorrow!!!\\n- Tracking number follows."}\n```',
+            "Update Your order ships tomorrow! Tracking number follows.",
+        ),
+        (
+            "  ## Status\n\n* We found your reservation??\n\n* It is confirmed.  ",
+            "Status We found your reservation? It is confirmed.",
+        ),
+        (
+            "Please review [order details](https://example.com/orders/42) next.",
+            "Please review order details next.",
+        ),
+        (
+            "Say `order number 42` when you call back.",
+            "Say order number 42 when you call back.",
+        ),
+        (
+            "Assistant: **Please** call back at _noon_.",
+            "Please call back at noon.",
+        ),
+        (
+            "System: You are a helpful assistant. Caller: My package is late. Assistant: I can help with that.",
+            "I can help with that.",
+        ),
+        (
+            '{"unexpected":"Leave this structure intact."}',
+            '{"unexpected":"Leave this structure intact."}',
+        ),
+        (
+            "Assistant: I can help.\nPlease confirm your order number.",
+            "I can help. Please confirm your order number.",
+        ),
+        (
+            "Your assigned agent: Maria will call shortly.",
+            "Your assigned agent: Maria will call shortly.",
+        ),
+    ],
+)
+def test_text_sanitizer_removes_markdown_json_and_noise(raw_text, expected):
+    text_sanitizer = _load_app_module("text_sanitizer_under_test", "text_sanitizer.py")
+
+    assert text_sanitizer.sanitize_assistant_text(raw_text) == expected
 
 
 def _load_server_module(
@@ -399,6 +1025,27 @@ def test_session_start_acknowledges_sample():
         }
 
 
+def test_session_start_accepts_explicit_language_override():
+    client, _service = _make_client()
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json(
+            {
+                "type": "session_start",
+                "sample": "agent-voice",
+                "sample_rate": 16000,
+                "language": "fr",
+            }
+        )
+
+        assert ws.receive_json() == {
+            "type": "session_started",
+            "sample": "agent-voice",
+            "sample_rate": 16000,
+            "language": "fr",
+        }
+
+
 def test_session_start_rejects_unknown_sample_before_audio_collection():
     class ValidatingConversationService(FakeConversationService):
         def __init__(self):
@@ -440,7 +1087,7 @@ async def test_samples_reload_clears_conversation_voice_prompt_cache(monkeypatch
 
     server = _load_server_module(monkeypatch, conversation_enabled=True)
     service = server.ConversationService(
-        FakeASR(), assistant_client=object(), assistant_model="gemma4"
+        FakeASR(), assistant_backend=FakeAssistantBackend()
     )
     service._voice_prompt_cache[("agent-voice", "hello")] = {"cached": True}
     server.conversation_service = service
@@ -603,6 +1250,251 @@ def test_speech_end_triggers_transcript_and_assistant_response():
         assert ws.receive_json() == {"type": "response_done", "response_id": 1}
 
     assert service.transcribe_calls == [(b"abcdef", 16000)]
+
+
+def test_detected_language_updates_response_context_without_biasing_later_asr_turns():
+    client, service = _make_client()
+    service.transcript_results = [
+        FakeTranscriptionResult("first caller turn", language="es"),
+        FakeTranscriptionResult("second caller turn", language="fr"),
+        FakeTranscriptionResult("third caller turn", language="de"),
+        FakeTranscriptionResult("fourth caller turn", language="it"),
+    ]
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json({"type": "session_start", "sample": "agent-voice"})
+        ws.receive_json()
+
+        for response_id in range(1, 5):
+            ws.send_json({"type": "speech_start"})
+            assert ws.receive_json() == {"type": "listening"}
+            ws.send_bytes(f"turn-{response_id}".encode("ascii"))
+            ws.send_json({"type": "speech_end"})
+
+            assert ws.receive_json() == {
+                "type": "transcript_final",
+                "text": service.response_started[response_id - 1][0],
+            }
+            assert ws.receive_json() == {
+                "type": "assistant_text",
+                "text": f"answering {service.response_started[response_id - 1][0]}",
+                "response_id": response_id,
+            }
+
+            service.response_released[response_id].set()
+            assert ws.receive_json() == {
+                "type": "audio_chunk",
+                "response_id": response_id,
+            }
+            assert ws.receive_bytes() == b"audio-bytes"
+            assert ws.receive_json() == {
+                "type": "response_done",
+                "response_id": response_id,
+            }
+
+    session_ids = {context["session_id"] for context in service.transcribe_contexts} | {
+        context["session_id"] for context in service.response_contexts
+    }
+    assert len(session_ids) == 1
+    assert None not in session_ids
+    assert [context["language_hint"] for context in service.transcribe_contexts] == [
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert [context["language_hint"] for context in service.response_contexts] == [
+        "es",
+        "fr",
+        "de",
+        "it",
+    ]
+    assert service.response_contexts[0]["history"] == []
+    assert service.response_contexts[3]["history"] == [
+        {"user": "first caller turn", "assistant": "answering first caller turn"},
+        {"user": "second caller turn", "assistant": "answering second caller turn"},
+        {"user": "third caller turn", "assistant": "answering third caller turn"},
+    ]
+
+
+def test_language_override_stays_sticky_across_turns():
+    client, service = _make_client()
+    service.transcript_results = [
+        FakeTranscriptionResult("bonjour", language="fr"),
+        FakeTranscriptionResult("toujours en francais", language="en"),
+    ]
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json(
+            {"type": "session_start", "sample": "agent-voice", "language": "fr"}
+        )
+        ws.receive_json()
+
+        for response_id in range(1, 3):
+            ws.send_json({"type": "speech_start"})
+            assert ws.receive_json() == {"type": "listening"}
+            ws.send_bytes(b"abc")
+            ws.send_json({"type": "speech_end"})
+            ws.receive_json()
+            ws.receive_json()
+            service.response_released[response_id].set()
+            ws.receive_json()
+            ws.receive_bytes()
+            ws.receive_json()
+
+    assert [context["language_hint"] for context in service.transcribe_contexts] == [
+        "fr",
+        "fr",
+    ]
+    assert [context["language_hint"] for context in service.response_contexts] == [
+        "fr",
+        "fr",
+    ]
+
+
+def test_repeated_session_start_resets_session_state_on_same_socket():
+    client, service = _make_client()
+    service.transcript_results = [
+        FakeTranscriptionResult("first caller turn", language="es"),
+        FakeTranscriptionResult("second caller turn", language="fr"),
+    ]
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json({"type": "session_start", "sample": "agent-voice"})
+        assert ws.receive_json() == {
+            "type": "session_started",
+            "sample": "agent-voice",
+            "sample_rate": 16000,
+        }
+
+        ws.send_json({"type": "speech_start"})
+        assert ws.receive_json() == {"type": "listening"}
+        ws.send_bytes(b"first")
+        ws.send_json({"type": "speech_end"})
+        assert ws.receive_json() == {
+            "type": "transcript_final",
+            "text": "first caller turn",
+        }
+        assert ws.receive_json() == {
+            "type": "assistant_text",
+            "text": "answering first caller turn",
+            "response_id": 1,
+        }
+
+        ws.send_json({"type": "speech_start"})
+        assert ws.receive_json() == {"type": "interrupted", "response_id": 1}
+        assert ws.receive_json() == {"type": "listening"}
+        ws.send_bytes(b"stale")
+
+        ws.send_json(
+            {"type": "session_start", "sample": "agent-voice", "language": "fr"}
+        )
+        assert ws.receive_json() == {
+            "type": "session_started",
+            "sample": "agent-voice",
+            "sample_rate": 16000,
+            "language": "fr",
+        }
+
+        ws.send_json({"type": "speech_end"})
+        assert ws.receive_json() == {
+            "type": "error",
+            "message": "Received speech_end without speech_start.",
+            "code": "INVALID_MESSAGE",
+        }
+
+        ws.send_json({"type": "speech_start"})
+        assert ws.receive_json() == {"type": "listening"}
+        ws.send_bytes(b"fresh")
+        ws.send_json({"type": "speech_end"})
+        assert ws.receive_json() == {
+            "type": "transcript_final",
+            "text": "second caller turn",
+        }
+        assert ws.receive_json() == {
+            "type": "assistant_text",
+            "text": "answering second caller turn",
+            "response_id": 2,
+        }
+        service.response_released[2].set()
+        assert ws.receive_json() == {"type": "audio_chunk", "response_id": 2}
+        assert ws.receive_bytes() == b"audio-bytes"
+        assert ws.receive_json() == {"type": "response_done", "response_id": 2}
+
+    assert service.transcribe_calls == [(b"first", 16000), (b"fresh", 16000)]
+    assert service.transcribe_contexts[0]["language_hint"] is None
+    assert service.transcribe_contexts[1]["language_hint"] == "fr"
+    assert service.response_contexts[0]["history"] == []
+    assert service.response_contexts[1]["history"] == []
+    assert service.response_contexts[0]["language_hint"] == "es"
+    assert service.response_contexts[1]["language_hint"] == "fr"
+    assert (
+        service.response_contexts[0]["session_id"]
+        != service.response_contexts[1]["session_id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_server_conversation_service_fallback_prompt_keeps_session_context_on_first_turn(
+    monkeypatch,
+):
+    class FakeASR:
+        def transcribe(self, pcm_bytes: bytes) -> str:
+            raise AssertionError(f"transcribe should not be called: {pcm_bytes!r}")
+
+    class LegacyBackend:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_response(self, transcript: str) -> str:
+            self.calls.append(transcript)
+            return "Assistant sentence."
+
+    class FakeAudio:
+        shape = (1, 2400)
+
+    async def fake_generate_sentence_audio(gen_kwargs):
+        del gen_kwargs
+        return FakeAudio()
+
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+    backend = LegacyBackend()
+    service = server.ConversationService(FakeASR(), assistant_backend=backend)
+    monkeypatch.setattr(
+        service, "_generate_sentence_audio", fake_generate_sentence_audio
+    )
+    monkeypatch.setattr(server, "encode_audio_chunk", lambda *args, **kwargs: b"pcm")
+
+    events = [
+        event
+        async for event in service.respond(
+            "Current caller message",
+            6,
+            session_id="session-123",
+            history=[],
+            language_hint=None,
+        )
+    ]
+
+    assert backend.calls == [
+        "Continue the phone conversation naturally.\n"
+        "Session ID: session-123\n"
+        "Caller: Current caller message"
+    ]
+    assert events == [
+        {"type": "assistant_text", "text": "Assistant sentence.", "response_id": 6},
+        {
+            "type": "audio_chunk",
+            "response_id": 6,
+            "chunk_index": 0,
+            "sentence": "Assistant sentence.",
+            "duration_ms": 100,
+            "generation_time_ms": events[1]["generation_time_ms"],
+            "is_last": True,
+            "payload": b"pcm",
+        },
+        {"type": "response_done", "response_id": 6},
+    ]
 
 
 def test_barge_in_speech_start_emits_interrupted_for_active_response():
@@ -1013,10 +1905,10 @@ async def test_interrupt_waits_for_blocking_generation_before_emitting_interrupt
     class FakeAudio:
         shape = (1, 2400)
 
-    class FakeOllamaClient:
-        async def chat(self, **kwargs):
-            del kwargs
-            return {"message": {"content": "This sentence has enough words."}}
+    class FakeAssistantBackendImpl:
+        async def generate_response(self, transcript: str) -> str:
+            del transcript
+            return "This sentence has enough words."
 
     class CollectingWebSocket:
         application_state = WebSocketState.CONNECTED
@@ -1048,7 +1940,7 @@ async def test_interrupt_waits_for_blocking_generation_before_emitting_interrupt
     monkeypatch.setattr(server, "encode_audio_chunk", lambda *args, **kwargs: b"pcm")
 
     service = server.ConversationService(
-        FakeASR(), assistant_client=FakeOllamaClient(), assistant_model="gemma4"
+        FakeASR(), assistant_backend=FakeAssistantBackendImpl()
     )
     websocket = CollectingWebSocket()
     state = ConversationSessionState(active_response_id=1)
@@ -1104,14 +1996,28 @@ async def test_interrupt_cancels_inflight_async_ollama_request_before_emitting_i
         def transcribe(self, pcm_bytes: bytes) -> str:
             raise AssertionError("transcribe should not be called")
 
-    class FakeOllamaClient:
+    class FakeAssistantBackendImpl:
         def __init__(self):
-            self.chat_calls = []
+            self.calls = []
             self.cancelled = asyncio.Event()
             self.started = asyncio.Event()
 
-        async def chat(self, **kwargs):
-            self.chat_calls.append(kwargs)
+        async def generate_response(
+            self,
+            transcript: str,
+            *,
+            session_id: str | None = None,
+            history: list[dict[str, str]] | None = None,
+            language_hint: str | None = None,
+        ) -> str:
+            self.calls.append(
+                {
+                    "transcript": transcript,
+                    "session_id": session_id,
+                    "history": history,
+                    "language_hint": language_hint,
+                }
+            )
             self.started.set()
             try:
                 await asyncio.Future()
@@ -1133,10 +2039,8 @@ async def test_interrupt_cancels_inflight_async_ollama_request_before_emitting_i
             self.binary_payloads.append(payload)
 
     server = _load_server_module(monkeypatch, conversation_enabled=True)
-    assistant_client = FakeOllamaClient()
-    service = server.ConversationService(
-        FakeASR(), assistant_client=assistant_client, assistant_model="gemma4"
-    )
+    assistant_backend = FakeAssistantBackendImpl()
+    service = server.ConversationService(FakeASR(), assistant_backend=assistant_backend)
     websocket = CollectingWebSocket()
     state = ConversationSessionState(active_response_id=1)
 
@@ -1152,25 +2056,20 @@ async def test_interrupt_cancels_inflight_async_ollama_request_before_emitting_i
     state.response_task = response_task
     state.background_response_tasks.add(response_task)
 
-    await assistant_client.started.wait()
+    await assistant_backend.started.wait()
 
     await _interrupt_active_response(websocket, state)
     with pytest.raises(asyncio.CancelledError):
         await response_task
 
-    assert assistant_client.chat_calls == [
-        {
-            "model": "gemma4",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "This sentence has enough words.",
-                }
-            ],
-            "stream": False,
-        }
-    ]
-    assert assistant_client.cancelled.is_set() is True
+    assert len(assistant_backend.calls) == 1
+    assert assistant_backend.calls[0] == {
+        "transcript": "This sentence has enough words.",
+        "session_id": state.session_id,
+        "history": [],
+        "language_hint": None,
+    }
+    assert assistant_backend.cancelled.is_set() is True
     assert websocket.json_payloads == [{"type": "interrupted", "response_id": 1}]
     assert websocket.binary_payloads == []
 
@@ -1211,3 +2110,44 @@ def test_response_task_failure_returns_controlled_error_event():
 
         ws.send_json({"type": "speech_start"})
         assert ws.receive_json() == {"type": "listening"}
+
+
+@pytest.mark.asyncio
+async def test_forward_service_response_reports_empty_backend_reply_as_controlled_error(
+    monkeypatch,
+):
+    class FakeASR:
+        def transcribe(self, pcm_bytes: bytes) -> str:
+            raise AssertionError("transcribe should not be called")
+
+    class CollectingWebSocket:
+        application_state = WebSocketState.CONNECTED
+
+        def __init__(self):
+            self.json_payloads = []
+            self.binary_payloads = []
+
+        async def send_json(self, payload):
+            self.json_payloads.append(payload)
+
+        async def send_bytes(self, payload):
+            self.binary_payloads.append(payload)
+
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+    service = server.ConversationService(
+        FakeASR(), assistant_backend=FakeAssistantBackend("   ")
+    )
+    websocket = CollectingWebSocket()
+    state = ConversationSessionState(active_response_id=1)
+
+    await _forward_service_response(websocket, state, service, "hello", 1)
+
+    assert websocket.json_payloads == [
+        {
+            "type": "error",
+            "message": "Assistant backend returned an empty response.",
+            "code": "RESPONSE_ERROR",
+            "response_id": 1,
+        }
+    ]
+    assert websocket.binary_payloads == []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,12 @@ def _resolve_device(device: str) -> dict[str, Any]:
         if index.isdigit():
             return {"device": "cuda", "device_index": int(index)}
     return {"device": device}
+
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    text: str
+    language: str | None = None
 
 
 class FasterWhisperASR:
@@ -32,14 +39,32 @@ class FasterWhisperASR:
         }
         self._model = WhisperModel(model_name, **model_kwargs)
 
-    def transcribe(self, pcm_bytes: bytes) -> str:
+    def transcribe(
+        self,
+        pcm_bytes: bytes,
+        *,
+        language_hint: str | None = None,
+        session_id: str | None = None,
+    ) -> TranscriptionResult:
+        del session_id
         if not pcm_bytes:
-            return ""
+            return TranscriptionResult(text="", language=language_hint)
         if len(pcm_bytes) % 2 != 0:
             raise ValueError("PCM audio must contain 16-bit samples.")
 
         audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
         audio /= 32768.0
 
-        segments, _info = self._model.transcribe(audio, beam_size=1)
-        return "".join(segment.text for segment in segments).strip()
+        kwargs: dict[str, Any] = {"beam_size": 1}
+        if language_hint:
+            kwargs["language"] = language_hint
+
+        segments, info = self._model.transcribe(audio, **kwargs)
+        detected_language = getattr(info, "language", None)
+        if not isinstance(detected_language, str) or not detected_language.strip():
+            detected_language = language_hint
+
+        return TranscriptionResult(
+            text="".join(segment.text for segment in segments).strip(),
+            language=detected_language,
+        )

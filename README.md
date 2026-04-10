@@ -180,6 +180,14 @@ python -m pip install faster-whisper ollama
 
 The server-side conversation path uses `faster-whisper` for ASR and Ollama for assistant text generation. By default it connects to `OMNIVOICE_OLLAMA_HOST=http://localhost:11434` and requests `OMNIVOICE_OLLAMA_MODEL=gemma4`.
 
+Assistant governance behavior for `/ws/conversation`:
+
+- Each WebSocket session gets an internal `session_id` that is passed to the assistant backend for turn correlation.
+- The server keeps a short rolling history of the latest completed turns and reuses it on later assistant requests to keep replies grounded in the ongoing call.
+- Language selection is sticky per session: an explicit `session_start.language` override wins, otherwise the latest ASR-detected language is reused as the next `language_hint`.
+- Assistant text is sanitized before TTS to strip common formatting noise and obvious wrapper content so spoken output stays concise and TTS-friendly for the existing duplex protocol.
+- After each completed turn, the server emits one JSON info log for operators with `session_id`, `response_id`, detected language, language hint, assistant backend/model, and per-stage latency fields (`asr_ms`, `llm_ms`, `tts_first_chunk_ms`, `tts_total_ms`, `turn_total_ms`). This is server-side diagnostics only; no new WebSocket messages are exposed to clients.
+
 Example invocation:
 
 ```bash
@@ -647,12 +655,12 @@ All configuration is via environment variables (set in `compose.yaml` or `.env`)
 | `OMNIVOICE_API_KEY` | _(unset)_ | API key for bearer-token auth. Unset = auth disabled |
 | `OMNIVOICE_CORS_ORIGINS` | _(empty)_ | Comma-separated list of allowed CORS origins. Empty = CORS disabled |
 | `OMNIVOICE_MAX_UPLOAD_BYTES` | `10485760` | Max text file upload size in bytes (default 10 MB) |
-| `OMNIVOICE_CONVERSATION_WS_ENABLED` | `true` | Enable/disable the experimental `/ws/conversation` endpoint |
-| `OMNIVOICE_ASR_MODEL` | `small` | `faster-whisper` model name or local path for conversation ASR |
+| `OMNIVOICE_CONVERSATION_WS_ENABLED` | `true` | Enable/disable the experimental `/ws/conversation` endpoint and its server-side assistant governance flow |
+| `OMNIVOICE_ASR_MODEL` | `small` | `faster-whisper` model name or local path used for conversation ASR, language detection, and turn latency logging |
 | `OMNIVOICE_ASR_DEVICE` | `auto` | `faster-whisper` device selection: `auto`, `cpu`, `cuda`, `cuda:0`, etc. |
 | `OMNIVOICE_ASR_COMPUTE_TYPE` | `default` | `faster-whisper` compute type passed to the ASR model |
-| `OMNIVOICE_OLLAMA_HOST` | `http://localhost:11434` | Ollama server base URL used for conversation assistant requests |
-| `OMNIVOICE_OLLAMA_MODEL` | `gemma4` | Ollama model used to generate assistant text for `/ws/conversation` |
+| `OMNIVOICE_OLLAMA_HOST` | `http://localhost:11434` | Ollama server base URL used for governed conversation assistant requests |
+| `OMNIVOICE_OLLAMA_MODEL` | `gemma4` | Ollama model used to generate assistant text; its name is also included in completed-turn diagnostic logs |
 
 ### Using a Pre-Downloaded Model
 
