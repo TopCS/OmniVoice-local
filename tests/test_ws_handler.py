@@ -201,6 +201,296 @@ def test_ws_set_voice_missing_sample_sends_session_error_then_closes():
             ws.receive_json()
 
 
+def test_ws_synthesize_uses_instruct_when_sample_is_missing_or_invalid():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "type": "synthesize",
+                "text": "Design this voice.",
+                "sample": "missing-sample",
+                "instruct": "Warm, patient narrator.",
+            }
+        )
+
+        meta = ws.receive_json()
+        audio = ws.receive_bytes()
+        done = ws.receive_json()
+
+    assert meta["type"] == "audio_chunk"
+    assert isinstance(audio, bytes) and len(audio) == 4800
+    assert done["type"] == "done"
+    assert model.generate_calls == [
+        {
+            "text": "Design this voice.",
+            "num_step": 16,
+            "instruct": "Warm, patient narrator.",
+        }
+    ]
+
+
+def test_ws_synthesize_prefers_sample_over_instruct_when_both_are_present():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "type": "synthesize",
+                "text": "Clone this voice.",
+                "sample": "agent-voice",
+                "instruct": "This should be ignored.",
+            }
+        )
+
+        meta = ws.receive_json()
+        audio = ws.receive_bytes()
+        done = ws.receive_json()
+
+    assert meta["type"] == "audio_chunk"
+    assert isinstance(audio, bytes) and len(audio) == 4800
+    assert done["type"] == "done"
+    assert len(model.prompt_calls) == 1
+    assert model.generate_calls[0]["voice_clone_prompt"]["cached"] is True
+    assert "instruct" not in model.generate_calls[0]
+
+
+def test_ws_invalid_sample_with_instruct_does_not_clear_cached_voice():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"type": "set_voice", "sample": "agent-voice"})
+        assert ws.receive_json() == {"type": "voice_set", "sample": "agent-voice"}
+
+        ws.send_json(
+            {
+                "type": "synthesize",
+                "text": "Temporary design voice.",
+                "sample": "missing-sample",
+                "instruct": "Use a bright, energetic tone.",
+            }
+        )
+        assert ws.receive_json()["type"] == "audio_chunk"
+        assert ws.receive_bytes() == b"x" * 4800
+        assert ws.receive_json()["type"] == "done"
+
+        ws.send_json({"type": "synthesize", "text": "Back to cached voice."})
+        assert ws.receive_json()["type"] == "audio_chunk"
+        assert ws.receive_bytes() == b"x" * 4800
+        assert ws.receive_json()["type"] == "done"
+
+    assert len(model.prompt_calls) == 1
+    assert model.generate_calls[0] == {
+        "text": "Temporary design voice.",
+        "num_step": 16,
+        "instruct": "Use a bright, energetic tone.",
+    }
+    assert model.generate_calls[1]["text"] == "Back to cached voice."
+    assert model.generate_calls[1]["num_step"] == 16
+    assert model.generate_calls[1]["voice_clone_prompt"]["cached"] is True
+    assert "instruct" not in model.generate_calls[1]
+
+
+def test_ws_text_flush_reuses_persisted_instruct_voice_design():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "type": "text_chunk",
+                "text": "Pending tail without punctuation",
+                "instruct": "Warm, patient narrator.",
+            }
+        )
+        ws.send_json({"type": "text_flush"})
+
+        meta = ws.receive_json()
+        audio = ws.receive_bytes()
+        done = ws.receive_json()
+
+    assert meta["type"] == "audio_chunk"
+    assert meta["sentence"] == "Pending tail without punctuation"
+    assert isinstance(audio, bytes) and len(audio) == 4800
+    assert done["type"] == "done"
+    assert model.generate_calls == [
+        {
+            "text": "Pending tail without punctuation",
+            "num_step": 16,
+            "instruct": "Warm, patient narrator.",
+        }
+    ]
+
+
+def test_ws_buffer_timeout_reuses_persisted_instruct_voice_design():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "type": "text_chunk",
+                "text": "Buffer timeout should keep this design",
+                "instruct": "Soft-spoken documentary voice.",
+            }
+        )
+
+        meta = ws.receive_json()
+        audio = ws.receive_bytes()
+
+    assert meta["type"] == "audio_chunk"
+    assert meta["sentence"] == "Buffer timeout should keep this design"
+    assert isinstance(audio, bytes) and len(audio) == 4800
+    assert model.generate_calls == [
+        {
+            "text": "Buffer timeout should keep this design",
+            "num_step": 16,
+            "instruct": "Soft-spoken documentary voice.",
+        }
+    ]
+
+
+def test_ws_text_flush_invalid_sample_with_instruct_uses_fallback_and_preserves_cached_voice():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"type": "set_voice", "sample": "agent-voice"})
+        assert ws.receive_json() == {"type": "voice_set", "sample": "agent-voice"}
+
+        ws.send_json(
+            {
+                "type": "text_chunk",
+                "text": "Deferred fallback on flush",
+                "sample": "missing-sample",
+                "instruct": "Warm fallback design.",
+            }
+        )
+        ws.send_json({"type": "text_flush"})
+
+        assert ws.receive_json()["type"] == "audio_chunk"
+        assert ws.receive_bytes() == b"x" * 4800
+        assert ws.receive_json()["type"] == "done"
+
+        ws.send_json({"type": "synthesize", "text": "Back to cached sample."})
+        assert ws.receive_json()["type"] == "audio_chunk"
+        assert ws.receive_bytes() == b"x" * 4800
+        assert ws.receive_json()["type"] == "done"
+
+    assert len(model.prompt_calls) == 1
+    assert model.generate_calls[0] == {
+        "text": "Deferred fallback on flush",
+        "num_step": 16,
+        "instruct": "Warm fallback design.",
+    }
+    assert model.generate_calls[1]["text"] == "Back to cached sample."
+    assert model.generate_calls[1]["voice_clone_prompt"]["cached"] is True
+    assert "instruct" not in model.generate_calls[1]
+
+
+def test_ws_buffer_timeout_invalid_sample_with_instruct_uses_fallback_and_preserves_cached_voice():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"type": "set_voice", "sample": "agent-voice"})
+        assert ws.receive_json() == {"type": "voice_set", "sample": "agent-voice"}
+
+        ws.send_json(
+            {
+                "type": "text_chunk",
+                "text": "Deferred fallback on timeout",
+                "sample": "missing-sample",
+                "instruct": "Documentary fallback design.",
+            }
+        )
+
+        assert ws.receive_json()["type"] == "audio_chunk"
+        assert ws.receive_bytes() == b"x" * 4800
+
+        ws.send_json({"type": "synthesize", "text": "Back to cached sample."})
+        assert ws.receive_json()["type"] == "audio_chunk"
+        assert ws.receive_bytes() == b"x" * 4800
+        assert ws.receive_json()["type"] == "done"
+
+    assert len(model.prompt_calls) == 1
+    assert model.generate_calls[0] == {
+        "text": "Deferred fallback on timeout",
+        "num_step": 16,
+        "instruct": "Documentary fallback design.",
+    }
+    assert model.generate_calls[1]["text"] == "Back to cached sample."
+    assert model.generate_calls[1]["voice_clone_prompt"]["cached"] is True
+    assert "instruct" not in model.generate_calls[1]
+
+
+def test_ws_text_flush_invalid_sample_with_instruct_works_without_cached_voice():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "type": "text_chunk",
+                "text": "Deferred fallback without cache",
+                "sample": "missing-sample",
+                "instruct": "No-cache fallback design.",
+            }
+        )
+        ws.send_json({"type": "text_flush"})
+
+        assert ws.receive_json()["type"] == "audio_chunk"
+        assert ws.receive_bytes() == b"x" * 4800
+        assert ws.receive_json()["type"] == "done"
+
+    assert model.generate_calls == [
+        {
+            "text": "Deferred fallback without cache",
+            "num_step": 16,
+            "instruct": "No-cache fallback design.",
+        }
+    ]
+
+
+def test_ws_text_flush_prefers_sample_over_instruct_when_both_are_present():
+    client, model = _make_client(
+        WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)
+    )
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"type": "text_chunk", "text": "Needs flush delivery"})
+        ws.send_json(
+            {
+                "type": "text_flush",
+                "sample": "agent-voice",
+                "instruct": "Ignore this on flush.",
+            }
+        )
+
+        meta = ws.receive_json()
+        audio = ws.receive_bytes()
+        done = ws.receive_json()
+
+    assert meta["type"] == "audio_chunk"
+    assert meta["sentence"] == "Needs flush delivery"
+    assert isinstance(audio, bytes) and len(audio) == 4800
+    assert done["type"] == "done"
+    assert len(model.prompt_calls) == 1
+    assert model.generate_calls[0]["voice_clone_prompt"]["cached"] is True
+    assert "instruct" not in model.generate_calls[0]
+
+
 def test_ws_synthesize_invalid_output_format_returns_error_without_done():
     client, model = _make_client(
         WSConfig(min_sentence_chars=1, max_sentence_chars=150, buffer_timeout_ms=50)

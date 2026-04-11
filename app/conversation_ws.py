@@ -30,6 +30,7 @@ class ConversationSessionState:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     started: bool = False
     sample: str | None = None
+    instruct: str | None = None
     sample_rate: int = SUPPORTED_SAMPLE_RATE
     language_override: str | None = None
     last_detected_language: str | None = None
@@ -143,6 +144,7 @@ async def _handle_event(
     msg_type = message.get("type")
     if msg_type == "session_start":
         sample = str(message["sample"]) if message.get("sample") else None
+        instruct = _normalize_instruct(message.get("instruct"))
         language = message.get("language")
         if language is not None:
             if not isinstance(language, str) or not language.strip():
@@ -189,6 +191,7 @@ async def _handle_event(
         await _reset_session_state(websocket, state)
         state.started = True
         state.sample = sample
+        state.instruct = instruct
         state.sample_rate = sample_rate
         state.language_override = language
         payload = {
@@ -389,6 +392,7 @@ async def _forward_service_response(
                 transcript,
                 response_id,
                 sample=state.sample,
+                instruct=None if state.sample else state.instruct,
                 session_id=state.session_id,
                 history=list(state.history),
                 language_hint=_current_language_hint(state),
@@ -510,6 +514,7 @@ def _call_service_respond(
     response_id: int,
     *,
     sample: str | None,
+    instruct: str | None,
     session_id: str,
     history: list[dict[str, str]],
     language_hint: str | None,
@@ -519,6 +524,7 @@ def _call_service_respond(
         transcript,
         response_id,
         sample=sample,
+        instruct=instruct,
         session_id=session_id,
         history=history,
         language_hint=language_hint,
@@ -676,6 +682,13 @@ def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
         name: value for name, value in kwargs.items() if name in supported_names
     }
     return func(*args, **supported_kwargs)
+
+
+def _normalize_instruct(instruct: Any) -> str | None:
+    if instruct is None:
+        return None
+    normalized = str(instruct).strip()
+    return normalized or None
 
 
 async def _send_error(websocket: WebSocket, message: str, code: str) -> None:

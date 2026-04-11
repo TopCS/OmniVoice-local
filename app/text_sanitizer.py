@@ -22,6 +22,23 @@ _REPEATED_BANG_OR_QUESTION_RE = re.compile(r"[!?]{2,}")
 _WHITESPACE_RE = re.compile(r"\s+")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,!?;:])")
 _JSON_TEXT_KEYS = ("reply", "response", "text", "message", "content", "assistant")
+_NON_VERBAL_TAG_RE = re.compile(r"\[([^\[\]\n]+)\]")
+_NO_JSON_TEXT = object()
+_ALLOWED_NON_VERBAL_TAGS = {
+    "laughter",
+    "sigh",
+    "confirmation-en",
+    "question-en",
+    "question-ah",
+    "question-oh",
+    "question-ei",
+    "question-yi",
+    "surprise-ah",
+    "surprise-oh",
+    "surprise-wa",
+    "surprise-yo",
+    "dissatisfaction-hnn",
+}
 
 
 def sanitize_assistant_text(text: Any) -> str:
@@ -32,12 +49,15 @@ def sanitize_assistant_text(text: Any) -> str:
 
     cleaned = _strip_code_fence_lines(cleaned)
     json_text = _extract_json_text(cleaned)
-    if json_text is not None:
+    if json_text is _NO_JSON_TEXT:
+        cleaned = ""
+    elif json_text is not None:
         cleaned = json_text
 
     cleaned = _strip_prompt_scaffolding(cleaned)
     cleaned = _strip_inline_formatting(cleaned)
     cleaned = _strip_markdown_line_prefixes(cleaned)
+    cleaned = _filter_non_verbal_tags(cleaned)
     cleaned = _collapse_punctuation_noise(cleaned)
     cleaned = _WHITESPACE_RE.sub(" ", cleaned)
     cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
@@ -48,9 +68,9 @@ def _strip_code_fence_lines(text: str) -> str:
     return _FENCE_LINE_RE.sub("", text).strip()
 
 
-def _extract_json_text(text: str) -> str | None:
+def _extract_json_text(text: str) -> object | str | None:
     candidate = text.strip()
-    if not candidate or candidate[0] not in "[{":
+    if not candidate:
         return None
 
     try:
@@ -58,7 +78,13 @@ def _extract_json_text(text: str) -> str | None:
     except json.JSONDecodeError:
         return None
 
-    return _unwrap_json_text(parsed)
+    if not isinstance(parsed, (dict, list)):
+        return _NO_JSON_TEXT
+
+    unwrapped = _unwrap_json_text(parsed)
+    if unwrapped is None:
+        return _NO_JSON_TEXT
+    return unwrapped
 
 
 def _unwrap_json_text(value: Any) -> str | None:
@@ -127,3 +153,13 @@ def _collapse_punctuation_noise(text: str) -> str:
         return "?" if "?" in punctuation else "!"
 
     return _REPEATED_BANG_OR_QUESTION_RE.sub(_replace_bang_or_question, text)
+
+
+def _filter_non_verbal_tags(text: str) -> str:
+    def _replace_tag(match: re.Match[str]) -> str:
+        tag = match.group(1)
+        if tag in _ALLOWED_NON_VERBAL_TAGS:
+            return match.group(0)
+        return ""
+
+    return _NON_VERBAL_TAG_RE.sub(_replace_tag, text)

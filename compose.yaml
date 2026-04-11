@@ -11,6 +11,7 @@ services:
       - "10200:10200"
     volumes:
       - ./app:/app
+      - ./voices:/voices
       - ./samples:/samples
       - ./outputs:/tmp/gradio
       - ./model:/model
@@ -19,6 +20,7 @@ services:
       - OMNIVOICE_MODEL=k2-fsa/OmniVoice
       - OMNIVOICE_DEVICE=cuda:0
       - OMNIVOICE_DTYPE=float16
+      - OMNIVOICE_VOICES_DIR=/voices
       - OMNIVOICE_SAMPLES_DIR=/samples
       - OMNIVOICE_HOST=0.0.0.0
       - OMNIVOICE_PORT=8000
