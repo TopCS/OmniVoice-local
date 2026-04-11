@@ -16,6 +16,7 @@ services:
       - ./model:/model
     environment:
       - HF_HOME=/model
+      - HF_TOKEN
       - OMNIVOICE_MODEL=k2-fsa/OmniVoice
       - OMNIVOICE_DEVICE=cuda:0
       - OMNIVOICE_DTYPE=float16
@@ -40,7 +41,7 @@ services:
       # Uncomment to override Wyoming advertised languages (comma-separated ISO 639-1):
       # - OMNIVOICE_WYOMING_LANGUAGES=en,ru,de
       # Uncomment to enable API key authentication:
-      # - OMNIVOICE_API_KEY=change-me-to-a-strong-secret
+      # - OMNIVOICE_API_KEY=${OMNIVOICE_API_KEY}
     deploy:
       resources:
         reservations:

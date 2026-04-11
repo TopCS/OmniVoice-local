@@ -57,9 +57,12 @@ You can add or remove samples at runtime and call `POST /samples/reload` to re-s
 # 1. Place voice samples
 cp my-voice.wav my-voice.txt ./samples/
 
-# 2. (Optional) Configure API key authentication
+# 2. Configure local secrets (optional but recommended)
 cp .env.example .env
-# Edit .env to set OMNIVOICE_API_KEY (other options live in compose.yaml)
+# Edit .env for local-only secrets:
+# - set HF_TOKEN if you need Hugging Face access for gated/rate-limited assets
+# - set OMNIVOICE_API_KEY if you want bearer-token auth and enable its compose.yaml mapping
+# .env is local and ignored by git; compose.yaml stays safe to commit because it only references env vars
 
 # 3. Build and start
 podman-compose up -d --build
@@ -77,6 +80,8 @@ curl -X POST http://localhost:8000/tts \
   -d '{"text": "Hello world!", "sample": "my-voice"}' \
   -o output.wav
 ```
+
+If you enable API key auth, keep the secret in `.env` and uncomment the `OMNIVOICE_API_KEY=${OMNIVOICE_API_KEY}` reference in `compose.yaml`. In this compose setup, setting `OMNIVOICE_API_KEY` in `.env` alone does not reach the container until that mapping is enabled.
 
 
 ### Wyoming / Home Assistant
@@ -631,19 +636,15 @@ curl -X POST http://localhost:8000/tts \
 
 ```bash
 cp .env.example .env
-# Edit .env, uncomment and set OMNIVOICE_API_KEY
+# Set OMNIVOICE_API_KEY in .env
+# Uncomment OMNIVOICE_API_KEY=${OMNIVOICE_API_KEY} in compose.yaml so it is passed into the container
 ```
 
-Or in `compose.yaml`:
-
-```yaml
-environment:
-  - OMNIVOICE_API_KEY=change-me-to-a-strong-secret
-```
+`.env` is local and ignored by git. Keep secrets there; `compose.yaml` is safe to commit because it contains only environment-variable references.
 
 ## Configuration
 
-All configuration is via environment variables (set in `compose.yaml` or `.env`):
+All configuration is via environment variables. Use `.env` for local secret values such as `HF_TOKEN` and `OMNIVOICE_API_KEY`, and let `compose.yaml` reference those variables:
 
 | Variable | Default | Description |
 |---|---|---|
