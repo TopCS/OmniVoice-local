@@ -13,7 +13,12 @@ PHONE_AGENT_SYSTEM_PROMPT = (
     "If a caller language hint is provided, treat it as authoritative for the reply language. "
     "Output plain text only. "
     "Do not use markdown, bullet points, emojis, JSON, XML, code blocks, "
-    "speaker labels, or stage directions."
+    "speaker labels, or stage directions. "
+    "Only these non-verbal tags are allowed when they genuinely help delivery: "
+    "[laughter], [sigh], [confirmation-en], [question-en], [question-ah], "
+    "[question-oh], [question-ei], [question-yi], [surprise-ah], [surprise-oh], "
+    "[surprise-wa], [surprise-yo], [dissatisfaction-hnn]. "
+    "Do not overuse them."
 )
 
 

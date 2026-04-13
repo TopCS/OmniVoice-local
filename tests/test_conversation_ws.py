@@ -603,6 +603,7 @@ async def test_server_conversation_service_streams_response_scoped_text_and_audi
             "Caller transcript that should not be echoed.",
             7,
             sample="agent-voice",
+            instruct="Ignore this prompt.",
         )
     ]
 
@@ -663,6 +664,71 @@ async def test_server_conversation_service_streams_response_scoped_text_and_audi
     assert server.model.prompt_calls == [
         {"ref_audio": "/tmp/agent.wav", "ref_text": "hello"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_server_conversation_service_passes_instruct_to_tts_without_sample(
+    monkeypatch,
+):
+    class FakeASR:
+        def transcribe(self, pcm_bytes: bytes) -> str:
+            raise AssertionError("transcribe should not be called")
+
+    class FakeAudio:
+        shape = (1, 2400)
+
+    generated_kwargs = []
+    assistant_backend = FakeAssistantBackend("Assistant sentence.")
+    server = _load_server_module(monkeypatch, conversation_enabled=True)
+
+    async def fake_generate_sentence_audio(gen_kwargs):
+        generated_kwargs.append(gen_kwargs)
+        return FakeAudio()
+
+    service = server.ConversationService(
+        FakeASR(),
+        assistant_backend=assistant_backend,
+    )
+    monkeypatch.setattr(
+        service, "_generate_sentence_audio", fake_generate_sentence_audio
+    )
+    monkeypatch.setattr(server, "encode_audio_chunk", lambda *args, **kwargs: b"pcm")
+
+    events = [
+        event
+        async for event in service.respond(
+            "Caller transcript that should not be echoed.",
+            8,
+            instruct="Calm and reassuring support agent.",
+        )
+    ]
+
+    assert events == [
+        {
+            "type": "assistant_text",
+            "text": "Assistant sentence.",
+            "response_id": 8,
+        },
+        {
+            "type": "audio_chunk",
+            "response_id": 8,
+            "chunk_index": 0,
+            "sentence": "Assistant sentence.",
+            "duration_ms": 100,
+            "generation_time_ms": events[1]["generation_time_ms"],
+            "is_last": True,
+            "payload": b"pcm",
+        },
+        {"type": "response_done", "response_id": 8},
+    ]
+    assert generated_kwargs == [
+        {
+            "text": "Assistant sentence.",
+            "num_step": server.WS_DEFAULT_NUM_STEP,
+            "instruct": "Calm and reassuring support agent.",
+        }
+    ]
+    assert assistant_backend.calls == ["Caller transcript that should not be echoed."]
 
 
 @pytest.mark.asyncio
@@ -855,6 +921,10 @@ async def test_ollama_assistant_backend_enforces_phone_agent_plain_text_policy()
     assert "reassuring" in system_prompt.lower()
     assert "plain text" in system_prompt.lower()
     assert "markdown" in system_prompt.lower()
+    assert "only these non-verbal tags" in system_prompt.lower()
+    assert "[laughter]" in system_prompt
+    assert "[question-en]" in system_prompt
+    assert "overuse" in system_prompt.lower()
 
 
 @pytest.mark.asyncio
@@ -969,7 +1039,27 @@ async def test_ollama_assistant_backend_raises_for_malformed_response(response):
         ),
         (
             '{"unexpected":"Leave this structure intact."}',
-            '{"unexpected":"Leave this structure intact."}',
+            "",
+        ),
+        (
+            '"hello"',
+            "",
+        ),
+        (
+            "123",
+            "",
+        ),
+        (
+            "true",
+            "",
+        ),
+        (
+            "false",
+            "",
+        ),
+        (
+            "null",
+            "",
         ),
         (
             "Assistant: I can help.\nPlease confirm your order number.",
@@ -978,6 +1068,26 @@ async def test_ollama_assistant_backend_raises_for_malformed_response(response):
         (
             "Your assigned agent: Maria will call shortly.",
             "Your assigned agent: Maria will call shortly.",
+        ),
+        (
+            "[laughter] I can help with that.",
+            "[laughter] I can help with that.",
+        ),
+        (
+            "[Laughter] I can help with that.",
+            "I can help with that.",
+        ),
+        (
+            "[ laughter ] I can help with that.",
+            "I can help with that.",
+        ),
+        (
+            "[wave] I can help with that.",
+            "I can help with that.",
+        ),
+        (
+            "[laughter] [wave] I can help with that.",
+            "[laughter] I can help with that.",
         ),
     ],
 )
@@ -1027,6 +1137,91 @@ def _load_server_module(
     return _load_app_module("server_under_test", "server.py")
 
 
+def test_server_uses_voices_dir_env_var_canonically(monkeypatch):
+    monkeypatch.setenv("OMNIVOICE_VOICES_DIR", "/voices-primary")
+    monkeypatch.setenv("OMNIVOICE_SAMPLES_DIR", "/samples-fallback")
+
+    server = _load_server_module(monkeypatch, conversation_enabled=False)
+
+    assert server.VOICES_DIR == Path("/voices-primary")
+
+
+def test_server_uses_samples_dir_env_var_as_compatibility_alias(monkeypatch):
+    monkeypatch.delenv("OMNIVOICE_VOICES_DIR", raising=False)
+    monkeypatch.setenv("OMNIVOICE_SAMPLES_DIR", "/samples-fallback")
+
+    server = _load_server_module(monkeypatch, conversation_enabled=False)
+
+    assert server.VOICES_DIR == Path("/samples-fallback")
+
+
+def test_server_falls_back_to_legacy_samples_dir_when_canonical_scan_is_empty(
+    monkeypatch,
+):
+    server = _load_server_module(monkeypatch, conversation_enabled=False)
+    server.VOICES_DIR = Path("/voices")
+    server.SAMPLES_DIR = Path("/samples")
+
+    scan_calls = []
+
+    def fake_scan_voices(directory):
+        scan_calls.append(directory)
+        if directory == Path("/voices"):
+            return {}
+        if directory == Path("/samples"):
+            return {
+                "legacy-voice": {"audio_path": "/samples/legacy.wav", "ref_text": "hi"}
+            }
+        raise AssertionError(f"unexpected scan dir: {directory}")
+
+    monkeypatch.setattr(server, "scan_voices", fake_scan_voices)
+
+    assert server._load_voice_samples() == {
+        "legacy-voice": {"audio_path": "/samples/legacy.wav", "ref_text": "hi"}
+    }
+    assert scan_calls == [Path("/voices"), Path("/samples")]
+
+
+def test_server_prefers_canonical_voices_dir_before_legacy_fallback(monkeypatch):
+    server = _load_server_module(monkeypatch, conversation_enabled=False)
+    server.VOICES_DIR = Path("/voices")
+    server.SAMPLES_DIR = Path("/samples")
+
+    scan_calls = []
+
+    def fake_scan_voices(directory):
+        scan_calls.append(directory)
+        if directory == Path("/voices"):
+            return {
+                "canonical-voice": {
+                    "audio_path": "/voices/canonical.wav",
+                    "ref_text": "hello",
+                }
+            }
+        raise AssertionError(f"legacy fallback should not scan: {directory}")
+
+    monkeypatch.setattr(server, "scan_voices", fake_scan_voices)
+
+    assert server._load_voice_samples() == {
+        "canonical-voice": {
+            "audio_path": "/voices/canonical.wav",
+            "ref_text": "hello",
+        }
+    }
+    assert scan_calls == [Path("/voices")]
+
+
+def test_server_registers_voice_routes_and_samples_aliases(monkeypatch):
+    server = _load_server_module(monkeypatch, conversation_enabled=False)
+
+    route_paths = {route.path for route in server.app.routes}
+
+    assert "/voices" in route_paths
+    assert "/voices/reload" in route_paths
+    assert "/samples" in route_paths
+    assert "/samples/reload" in route_paths
+
+
 def test_session_start_acknowledges_sample():
     client, _service = _make_client()
 
@@ -1063,6 +1258,157 @@ def test_session_start_accepts_explicit_language_override():
         }
 
 
+def test_session_start_persists_instruct_for_tts_when_sample_is_absent():
+    class InstructAwareConversationService(FakeConversationService):
+        def __init__(self):
+            super().__init__()
+            self.response_instructs = []
+
+        async def respond(
+            self,
+            transcript: str,
+            response_id: int,
+            *,
+            sample: str | None = None,
+            instruct: str | None = None,
+            session_id: str | None = None,
+            history: list[dict[str, str]] | None = None,
+            language_hint: str | None = None,
+        ):
+            self.response_started.append((transcript, response_id, sample))
+            self.response_contexts.append(
+                {
+                    "session_id": session_id,
+                    "history": history,
+                    "language_hint": language_hint,
+                }
+            )
+            self.response_instructs.append(instruct)
+            yield {"type": "assistant_text", "text": f"answering {transcript}"}
+
+            gate = self.response_released.setdefault(response_id, asyncio.Event())
+            await gate.wait()
+
+            yield {
+                "type": "audio_chunk",
+                "response_id": response_id,
+                "payload": b"audio-bytes",
+            }
+            yield {"type": "response_done", "response_id": response_id}
+
+    service = InstructAwareConversationService()
+    client = _make_client_with_service(service)
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json(
+            {
+                "type": "session_start",
+                "instruct": "Calm and reassuring support agent.",
+                "sample_rate": 16000,
+            }
+        )
+        assert ws.receive_json() == {
+            "type": "session_started",
+            "sample": None,
+            "sample_rate": 16000,
+        }
+
+        ws.send_json({"type": "speech_start"})
+        assert ws.receive_json() == {"type": "listening"}
+        ws.send_bytes(AUDIO_CHUNK_A)
+        ws.send_json({"type": "speech_end"})
+
+        assert ws.receive_json() == {"type": "transcript_final", "text": "hello there"}
+        assert ws.receive_json() == {
+            "type": "assistant_text",
+            "text": "answering hello there",
+            "response_id": 1,
+        }
+        service.response_released[1].set()
+        assert ws.receive_json() == {"type": "audio_chunk", "response_id": 1}
+        assert ws.receive_bytes() == b"audio-bytes"
+        assert ws.receive_json() == {"type": "response_done", "response_id": 1}
+
+    assert service.response_started == [("hello there", 1, None)]
+    assert service.response_instructs == ["Calm and reassuring support agent."]
+
+
+def test_session_start_sample_still_wins_over_instruct_for_tts():
+    class InstructAwareConversationService(FakeConversationService):
+        def __init__(self):
+            super().__init__()
+            self.response_instructs = []
+
+        async def respond(
+            self,
+            transcript: str,
+            response_id: int,
+            *,
+            sample: str | None = None,
+            instruct: str | None = None,
+            session_id: str | None = None,
+            history: list[dict[str, str]] | None = None,
+            language_hint: str | None = None,
+        ):
+            self.response_started.append((transcript, response_id, sample))
+            self.response_contexts.append(
+                {
+                    "session_id": session_id,
+                    "history": history,
+                    "language_hint": language_hint,
+                }
+            )
+            self.response_instructs.append(instruct)
+            yield {"type": "assistant_text", "text": f"answering {transcript}"}
+
+            gate = self.response_released.setdefault(response_id, asyncio.Event())
+            await gate.wait()
+
+            yield {
+                "type": "audio_chunk",
+                "response_id": response_id,
+                "payload": b"audio-bytes",
+            }
+            yield {"type": "response_done", "response_id": response_id}
+
+    service = InstructAwareConversationService()
+    client = _make_client_with_service(service)
+
+    with client.websocket_connect("/ws/conversation") as ws:
+        ws.send_json(
+            {
+                "type": "session_start",
+                "sample": "agent-voice",
+                "instruct": "Ignore this prompt.",
+                "sample_rate": 16000,
+            }
+        )
+        assert ws.receive_json() == {
+            "type": "session_started",
+            "sample": "agent-voice",
+            "sample_rate": 16000,
+        }
+
+        ws.send_json({"type": "speech_start"})
+        assert ws.receive_json() == {"type": "listening"}
+        ws.send_bytes(AUDIO_CHUNK_A)
+        ws.send_json({"type": "speech_end"})
+
+        assert ws.receive_json() == {"type": "transcript_final", "text": "hello there"}
+        assert ws.receive_json() == {
+            "type": "assistant_text",
+            "text": "answering hello there",
+            "response_id": 1,
+        }
+        service.response_released[1].set()
+        assert ws.receive_json() == {"type": "audio_chunk", "response_id": 1}
+        assert ws.receive_bytes() == b"audio-bytes"
+        assert ws.receive_json() == {"type": "response_done", "response_id": 1}
+
+    assert service.response_started == [("hello there", 1, "agent-voice")]
+    assert service.response_instructs == [None]
+
+
 def test_session_start_rejects_unknown_sample_before_audio_collection():
     class ValidatingConversationService(FakeConversationService):
         def __init__(self):
@@ -1097,7 +1443,7 @@ def test_session_start_rejects_unknown_sample_before_audio_collection():
 
 
 @pytest.mark.asyncio
-async def test_samples_reload_clears_conversation_voice_prompt_cache(monkeypatch):
+async def test_voices_reload_clears_conversation_voice_prompt_cache(monkeypatch):
     class FakeASR:
         def transcribe(self, pcm_bytes: bytes) -> str:
             raise AssertionError("transcribe should not be called")
@@ -1112,18 +1458,37 @@ async def test_samples_reload_clears_conversation_voice_prompt_cache(monkeypatch
         "agent-voice": {"audio_path": "/tmp/old.wav", "ref_text": "hello"}
     }
 
-    def fake_scan_samples(_directory):
+    def fake_scan_voices(_directory):
         return {"agent-voice": {"audio_path": "/tmp/new.wav", "ref_text": "updated"}}
 
-    monkeypatch.setattr(server, "scan_samples", fake_scan_samples)
+    monkeypatch.setattr(server, "scan_voices", fake_scan_voices)
 
-    result = await server.reload_samples(None)
+    result = await server.reload_voices(None)
 
     assert result == {"status": "ok", "count": 1}
     assert server.voice_samples == {
         "agent-voice": {"audio_path": "/tmp/new.wav", "ref_text": "updated"}
     }
     assert service._voice_prompt_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_samples_reload_alias_reuses_voice_reload_handler(monkeypatch):
+    server = _load_server_module(monkeypatch, conversation_enabled=False)
+    server.voice_samples = {}
+
+    scan_calls = []
+
+    def fake_scan_voices(directory):
+        scan_calls.append(directory)
+        return {"agent-voice": {"audio_path": "/tmp/new.wav", "ref_text": "updated"}}
+
+    monkeypatch.setattr(server, "scan_voices", fake_scan_voices)
+
+    result = await server.reload_samples(None)
+
+    assert result == {"status": "ok", "count": 1}
+    assert scan_calls == [server.VOICES_DIR]
 
 
 def test_health_counts_conversation_websocket_connections(monkeypatch):

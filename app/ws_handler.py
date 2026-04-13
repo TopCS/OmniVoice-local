@@ -40,6 +40,7 @@ class WSSessionState:
     total_generation_time_ms: int = 0
     prompt_sample: Optional[str] = None
     prompt_text: Optional[str] = None
+    prompt_instruct: Optional[str] = None
     voice_clone_prompt: Any = None
     opened_at: float = field(default_factory=time.monotonic)
 
@@ -98,6 +99,7 @@ def create_ws_router(
                             model_lock,
                             config,
                         )
+                        state.prompt_instruct = None
                     continue
                 await _handle_message(
                     websocket,
@@ -187,6 +189,9 @@ async def _handle_message(
         state.text_buffer = ""
         synthesized = False
         if pending:
+            await _ensure_voice_prompt(
+                message, state, get_model, get_voice_samples, model_lock
+            )
             synthesized = await _synthesize_sentences(
                 websocket,
                 splitter.split_text(pending),
@@ -198,6 +203,7 @@ async def _handle_message(
             )
         if not pending or synthesized:
             await _send_done(websocket, state)
+            state.prompt_instruct = None
         return
 
     if msg_type == "set_voice":
@@ -238,10 +244,7 @@ async def _synthesize_sentences(
         }
         if message.get("speed") is not None:
             gen_kwargs["speed"] = float(message["speed"])
-        if state.voice_clone_prompt is not None:
-            gen_kwargs["voice_clone_prompt"] = state.voice_clone_prompt
-        elif message.get("instruct"):
-            gen_kwargs["instruct"] = str(message["instruct"])
+        gen_kwargs.update(_resolve_generation_voice_kwargs(message, state))
 
         started = time.monotonic()
         audio = await _generate_one(get_model, model_lock, gen_kwargs)
@@ -294,9 +297,13 @@ async def _ensure_voice_prompt(
     force: bool = False,
 ) -> None:
     sample = message.get("sample")
+    instruct = _message_instruct(message)
+    should_persist_instruct = _should_persist_instruct(message)
     if not sample:
         if force:
             raise RuntimeError("Field 'sample' is required.")
+        if instruct is not None and should_persist_instruct:
+            state.prompt_instruct = instruct
         return
 
     sample_name = str(sample)
@@ -309,6 +316,10 @@ async def _ensure_voice_prompt(
 
     samples = get_voice_samples()
     if sample_name not in samples:
+        if not force and instruct is not None:
+            if should_persist_instruct:
+                state.prompt_instruct = instruct
+            return
         raise RuntimeError(f"Sample '{sample_name}' not found.")
 
     sample_info = samples[sample_name]
@@ -332,6 +343,43 @@ async def _ensure_voice_prompt(
         )
     state.prompt_sample = sample_name
     state.prompt_text = ref_text
+    state.prompt_instruct = None
+
+
+def _message_instruct(message: dict[str, Any]) -> Optional[str]:
+    instruct = message.get("instruct")
+    if instruct is None:
+        return None
+    normalized = str(instruct).strip()
+    return normalized or None
+
+
+def _resolve_generation_voice_kwargs(
+    message: dict[str, Any], state: WSSessionState
+) -> dict[str, Any]:
+    sample = message.get("sample")
+    instruct = _message_instruct(message)
+    should_persist_instruct = _should_persist_instruct(message)
+    if sample:
+        sample_name = str(sample)
+        if state.prompt_sample == sample_name and state.voice_clone_prompt is not None:
+            return {"voice_clone_prompt": state.voice_clone_prompt}
+        if instruct is not None:
+            return {"instruct": instruct}
+        return {}
+    if instruct is not None:
+        return {"instruct": instruct}
+    if should_persist_instruct and state.prompt_instruct is not None:
+        return {"instruct": state.prompt_instruct}
+    if state.voice_clone_prompt is not None:
+        return {"voice_clone_prompt": state.voice_clone_prompt}
+    if state.prompt_instruct is not None:
+        return {"instruct": state.prompt_instruct}
+    return {}
+
+
+def _should_persist_instruct(message: dict[str, Any]) -> bool:
+    return message.get("type") in {"text_chunk", "text_flush"}
 
 
 async def _recv_json(

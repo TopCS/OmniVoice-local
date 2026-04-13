@@ -5,7 +5,7 @@ OmniVoice TTS HTTP Server
 
 Purpose:
     FastAPI-based HTTP server wrapping the OmniVoice TTS model.
-    Provides voice cloning via a pre-configured sample directory,
+    Provides voice cloning via a pre-configured voices directory,
     voice design via speaker attribute instructions, and auto-voice mode.
     All OmniVoice generation parameters are exposed through the API.
 
@@ -16,11 +16,11 @@ Usage:
     # Start with default settings:
     python server.py
 
-    # Custom GPU and sample directory:
-    OMNIVOICE_DEVICE=cuda:1 OMNIVOICE_SAMPLES_DIR=/samples python server.py
+    # Custom GPU and voices directory:
+    OMNIVOICE_DEVICE=cuda:1 OMNIVOICE_VOICES_DIR=/voices python server.py
 
     # Inside container (typical):
-    # Model and samples are mounted as bind volumes, see compose.yaml
+    # Model and voices are mounted as bind volumes, see compose.yaml
 
 Environment variables:
     OMNIVOICE_MODEL          - HuggingFace model ID or local path
@@ -29,8 +29,9 @@ Environment variables:
                                (default: cuda:0)
     OMNIVOICE_DTYPE          - Model dtype: float16, bfloat16, float32
                                (default: float16)
-    OMNIVOICE_SAMPLES_DIR    - Path to voice samples directory
-                               (default: /samples)
+    OMNIVOICE_VOICES_DIR     - Path to voice assets directory
+                               (default: /voices)
+    OMNIVOICE_SAMPLES_DIR    - Compatibility alias for OMNIVOICE_VOICES_DIR
     OMNIVOICE_HOST           - Server bind address (default: 0.0.0.0)
     OMNIVOICE_PORT           - Server bind port (default: 8000)
     OMNIVOICE_OUTPUT_FORMAT  - Default output audio format: wav, mp3, flac, ogg
@@ -104,13 +105,31 @@ logging.basicConfig(
 )
 log = logging.getLogger("omnivoice-server")
 
+
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
+def _resolve_voices_dir() -> Path:
+    voices_dir = os.environ.get("OMNIVOICE_VOICES_DIR")
+    if voices_dir:
+        return Path(voices_dir)
+
+    samples_dir = os.environ.get("OMNIVOICE_SAMPLES_DIR")
+    if samples_dir:
+        return Path(samples_dir)
+
+    return Path("/voices")
+
+
+def _resolve_samples_dir() -> Path:
+    return Path(os.environ.get("OMNIVOICE_SAMPLES_DIR", "/samples"))
+
+
 MODEL_ID = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 DEVICE = os.environ.get("OMNIVOICE_DEVICE", "cuda:0")
 DTYPE_STR = os.environ.get("OMNIVOICE_DTYPE", "float16")
-SAMPLES_DIR = Path(os.environ.get("OMNIVOICE_SAMPLES_DIR", "/samples"))
+VOICES_DIR = _resolve_voices_dir()
+SAMPLES_DIR = _resolve_samples_dir()
 HOST = os.environ.get("OMNIVOICE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("OMNIVOICE_PORT", "8000"))
 DEFAULT_OUTPUT_FORMAT = os.environ.get("OMNIVOICE_OUTPUT_FORMAT", "wav")
@@ -222,13 +241,13 @@ async def require_api_key(
 
 
 # ---------------------------------------------------------------------------
-# Sample directory scanner
+# Voice directory scanner
 # ---------------------------------------------------------------------------
 
 
-def scan_samples(directory: Path) -> dict:
+def scan_voices(directory: Path) -> dict:
     """
-    Scan the samples directory for audio + transcript pairs.
+    Scan the voices directory for audio + transcript pairs.
 
     Expected structure:
         some-name.wav   + some-name.txt
@@ -239,11 +258,11 @@ def scan_samples(directory: Path) -> dict:
     will be None (OmniVoice will use Whisper to auto-transcribe).
 
     Returns:
-        dict[str, dict] mapping sample name -> {audio_path, ref_text}
+        dict[str, dict] mapping voice name -> {audio_path, ref_text}
     """
     samples = {}
     if not directory.is_dir():
-        log.warning("Samples directory does not exist: %s", directory)
+        log.warning("Voices directory does not exist: %s", directory)
         return samples
 
     audio_files = {}
@@ -279,6 +298,24 @@ def scan_samples(directory: Path) -> dict:
     return samples
 
 
+scan_samples = scan_voices
+
+
+def _load_voice_samples() -> dict:
+    samples = scan_voices(VOICES_DIR)
+    if samples or SAMPLES_DIR == VOICES_DIR:
+        return samples
+
+    legacy_samples = scan_voices(SAMPLES_DIR)
+    if legacy_samples:
+        log.warning(
+            "No voices found in %s; falling back to legacy samples directory %s",
+            VOICES_DIR,
+            SAMPLES_DIR,
+        )
+    return legacy_samples
+
+
 # ---------------------------------------------------------------------------
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
@@ -298,8 +335,8 @@ class TTSRequest(BaseModel):
     sample: Optional[str] = Field(
         None,
         description=(
-            "Name of a voice sample (stem without extension) from the "
-            "samples directory. Enables voice cloning mode."
+            "Name of a voice asset (stem without extension) from the "
+            "voices directory. Enables voice cloning mode."
         ),
     )
     instruct: Optional[str] = Field(
@@ -410,7 +447,7 @@ class TTSRequest(BaseModel):
 
 
 class SampleInfo(BaseModel):
-    """Info about a single voice sample."""
+    """Info about a single voice asset."""
 
     name: str
     audio_file: str
@@ -437,7 +474,7 @@ class OpenAISpeechRequest(BaseModel):
         ...,
         description=(
             "Voice to use. Standard OpenAI voices (alloy, ash, coral, echo, fable, nova, "
-            "onyx, sage, shimmer) map to a voice sample of the same name when available, "
+            "onyx, sage, shimmer) map to a voice asset of the same name when available, "
             "or fall back to auto-voice mode. Any sample name loaded on the server can also "
             "be used directly."
         ),
@@ -549,6 +586,7 @@ class ConversationService:
         response_id: int,
         *,
         sample: str | None = None,
+        instruct: str | None = None,
         session_id: str | None = None,
         history: list[dict[str, str]] | None = None,
         language_hint: str | None = None,
@@ -601,6 +639,8 @@ class ConversationService:
             }
             if voice_clone_prompt is not None:
                 gen_kwargs["voice_clone_prompt"] = voice_clone_prompt
+            elif instruct is not None:
+                gen_kwargs["instruct"] = instruct
 
             started = time.monotonic()
             audio = await self._generate_sentence_audio(gen_kwargs)
@@ -818,6 +858,7 @@ class _ConversationServiceProxy:
         response_id: int,
         *,
         sample: str | None = None,
+        instruct: str | None = None,
         session_id: str | None = None,
         history: list[dict[str, str]] | None = None,
         language_hint: str | None = None,
@@ -826,6 +867,7 @@ class _ConversationServiceProxy:
             transcript,
             response_id,
             sample=sample,
+            instruct=instruct,
             session_id=session_id,
             history=history,
             language_hint=language_hint,
@@ -944,8 +986,8 @@ async def lifespan(application: FastAPI):
     )
     log.info("Model loaded successfully.")
 
-    log.info("Scanning samples directory: %s", SAMPLES_DIR)
-    voice_samples = scan_samples(SAMPLES_DIR)
+    log.info("Scanning voices directory: %s", VOICES_DIR)
+    voice_samples = _load_voice_samples()
 
     if CONVERSATION_WS_ENABLED:
         log.info("Loading ASR model: %s", ASR_MODEL)
@@ -976,7 +1018,7 @@ app = FastAPI(
     title="OmniVoice TTS Server",
     description=(
         "HTTP API for OmniVoice zero-shot multilingual TTS. "
-        "Supports voice cloning (via pre-loaded samples), "
+        "Supports voice cloning (via pre-loaded voices), "
         "voice design (via speaker attribute instructions), "
         "and auto-voice mode."
     ),
@@ -1366,9 +1408,10 @@ async def health():
     )
 
 
-@app.get("/samples", response_model=list[SampleInfo], tags=["Samples"])
-async def list_samples(_: None = Depends(require_api_key)):
-    """List all available voice samples."""
+@app.get("/voices", response_model=list[SampleInfo], tags=["Voices"])
+@app.get("/samples", response_model=list[SampleInfo], tags=["Voices"])
+async def list_voices(_: None = Depends(require_api_key)):
+    """List all available voice assets."""
     result = []
     for name, info in sorted(voice_samples.items()):
         preview = None
@@ -1387,14 +1430,21 @@ async def list_samples(_: None = Depends(require_api_key)):
     return result
 
 
-@app.post("/samples/reload", tags=["Samples"])
-async def reload_samples(_: None = Depends(require_api_key)):
-    """Re-scan the samples directory (e.g. after adding new files)."""
+list_samples = list_voices
+
+
+@app.post("/voices/reload", tags=["Voices"])
+@app.post("/samples/reload", tags=["Voices"])
+async def reload_voices(_: None = Depends(require_api_key)):
+    """Re-scan the voices directory (e.g. after adding new files)."""
     global voice_samples
-    voice_samples = scan_samples(SAMPLES_DIR)
+    voice_samples = _load_voice_samples()
     if conversation_service is not None:
         conversation_service.clear_voice_prompt_cache()
     return {"status": "ok", "count": len(voice_samples)}
+
+
+reload_samples = reload_voices
 
 
 # ---------------------------------------------------------------------------
