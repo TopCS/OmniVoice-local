@@ -79,6 +79,7 @@ def build_session_start(
     sample: str | None = None,
     sample_rate: int = UPLINK_SAMPLE_RATE,
     language: str | None = None,
+    instruct: str | None = None,
 ) -> dict[str, object]:
     event: dict[str, object] = {
         "type": "session_start",
@@ -88,6 +89,8 @@ def build_session_start(
         event["sample"] = sample
     if language is not None:
         event["language"] = language
+    if instruct is not None:
+        event["instruct"] = instruct
     return event
 
 
@@ -408,6 +411,7 @@ async def run_client(
     url: str,
     sample: str | None,
     language: str | None,
+    instruct: str | None,
     websockets_module,
     pyaudio_module,
     torch_module,
@@ -415,7 +419,13 @@ async def run_client(
 ) -> None:
     async with websockets_module.connect(url) as websocket:
         await websocket.send(
-            json.dumps(build_session_start(sample=sample, language=language))
+            json.dumps(
+                build_session_start(
+                    sample=sample,
+                    language=language,
+                    instruct=instruct,
+                )
+            )
         )
 
         audio_api = None
@@ -482,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--url", default="ws://localhost:8000/ws/conversation")
     parser.add_argument("--sample")
     parser.add_argument("--language")
+    parser.add_argument("--instruct")
     args = parser.parse_args(argv)
 
     try:
@@ -523,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.url,
                 args.sample,
                 args.language,
+                args.instruct,
                 websockets,
                 pyaudio,
                 torch,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import io
+import json
 import sys
 import threading
 import types
@@ -239,14 +240,17 @@ def test_terminal_visualizer_default_constructor_disables_when_stderr_is_not_a_t
     assert stderr_stream.getvalue() == ""
 
 
-def test_build_session_start_includes_explicit_language_override():
+def test_build_session_start_includes_explicit_language_override_and_instruct():
     client = _load_module()
 
-    assert client.build_session_start(sample="agent", language="it") == {
+    assert client.build_session_start(
+        sample="agent", language="it", instruct="Warm and patient narrator."
+    ) == {
         "type": "session_start",
         "sample_rate": 16000,
         "sample": "agent",
         "language": "it",
+        "instruct": "Warm and patient narrator.",
     }
 
 
@@ -393,6 +397,7 @@ def test_open_audio_streams_and_main_use_expected_runtime_configuration(monkeypa
         url,
         sample,
         language,
+        instruct,
         websockets_module,
         pyaudio_module,
         torch_module,
@@ -403,6 +408,7 @@ def test_open_audio_streams_and_main_use_expected_runtime_configuration(monkeypa
                 "url": url,
                 "sample": sample,
                 "language": language,
+                "instruct": instruct,
                 "websockets": websockets_module,
                 "pyaudio": pyaudio_module,
                 "torch": torch_module,
@@ -425,6 +431,8 @@ def test_open_audio_streams_and_main_use_expected_runtime_configuration(monkeypa
                 "agent",
                 "--language",
                 "it",
+                "--instruct",
+                "Warm and patient narrator.",
             ]
         )
         == 0
@@ -433,6 +441,7 @@ def test_open_audio_streams_and_main_use_expected_runtime_configuration(monkeypa
         "url": "ws://example/ws/conversation",
         "sample": "agent",
         "language": "it",
+        "instruct": "Warm and patient narrator.",
         "websockets": sys.modules["websockets"],
         "pyaudio": sys.modules["pyaudio"],
         "torch": sys.modules["torch"],
@@ -683,6 +692,7 @@ async def test_run_client_builds_visualizer_and_attaches_it_to_playback_and_stat
         "ws://example/ws/conversation",
         "agent",
         None,
+        "Warm and patient narrator.",
         websockets_module,
         pyaudio_module,
         torch_module,
@@ -695,6 +705,12 @@ async def test_run_client_builds_visualizer_and_attaches_it_to_playback_and_stat
     assert captured["state_sample"] == "agent"
     assert captured["state_visualizer"] is created_visualizers[0]
     assert captured["playback_on_drain"] == captured["receive_loop"][1].playback_drained
+    assert json.loads(captured["messages"][0]) == {
+        "type": "session_start",
+        "sample_rate": 16000,
+        "sample": "agent",
+        "instruct": "Warm and patient narrator.",
+    }
 
 
 @pytest.mark.asyncio

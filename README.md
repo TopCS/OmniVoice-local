@@ -250,6 +250,25 @@ python examples/ws_duplex_client.py \
 
 Use `--language <code>` when you want to force the ASR language for the whole session, for example `--language it` for Italian. If omitted, the server falls back to per-session language detection and sticky language hints.
 
+You can also use inferred voice design directly from the duplex client:
+
+```bash
+python examples/ws_duplex_client.py \
+  --url ws://server-host:8000/ws/conversation \
+  --instruct "female, calm, warm voice" \
+  --language it
+```
+
+If you provide both `--sample` and `--instruct`, the client forwards both and the server keeps the canonical precedence rule: the selected `sample` wins and `instruct` is ignored for TTS.
+
+```bash
+python examples/ws_duplex_client.py \
+  --url ws://server-host:8000/ws/conversation \
+  --sample your-sample-name \
+  --instruct "male, deep, robotic voice" \
+  --language it
+```
+
 Manual duplex smoke flow for a real workstation + server setup:
 
 ```bash
@@ -261,6 +280,15 @@ docker compose up -d --build
 python examples/ws_duplex_client.py \
   --url ws://localhost:8000/ws/conversation \
   --sample your-sample-name \
+  --language it
+```
+
+Or test inferred voice design instead of cloning:
+
+```bash
+python examples/ws_duplex_client.py \
+  --url ws://localhost:8000/ws/conversation \
+  --instruct "female, calm, warm voice" \
   --language it
 ```
 
