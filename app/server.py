@@ -61,6 +61,10 @@ Environment variables:
     OMNIVOICE_ASR_COMPUTE_TYPE - faster-whisper compute type (default: default)
     OMNIVOICE_OLLAMA_HOST    - Ollama API base URL (default: http://localhost:11434)
     OMNIVOICE_OLLAMA_MODEL   - Ollama model for assistant replies (default: gemma4)
+    OMNIVOICE_LLM_PROVIDER   - Assistant backend: "ollama" or "openai" (default: ollama)
+    OMNIVOICE_OPENAI_BASE_URL - OpenAI-compatible API base URL (default: http://localhost:8010/v1)
+    OMNIVOICE_OPENAI_MODEL   - OpenAI-compatible model name (default: gpt-4o-mini)
+    OMNIVOICE_OPENAI_API_KEY - API key for OpenAI-compatible endpoint (default: unset)
 """
 
 import hmac
@@ -85,7 +89,7 @@ import uvicorn
 from audio_encoder import encode_audio_chunk
 from fastapi import Depends, FastAPI, Form, HTTPException, Security, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from conversation_ws import create_conversation_router
@@ -181,6 +185,10 @@ ASR_LANGUAGE_STICKY_MIN_PROB = float(
 )
 OLLAMA_HOST = os.environ.get("OMNIVOICE_OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OMNIVOICE_OLLAMA_MODEL", "gemma4")
+LLM_BACKEND = os.environ.get("OMNIVOICE_LLM_PROVIDER", "ollama").lower()
+OPENAI_BASE_URL = os.environ.get("OMNIVOICE_OPENAI_BASE_URL", "http://localhost:8010/v1")
+OPENAI_MODEL = os.environ.get("OMNIVOICE_OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.environ.get("OMNIVOICE_OPENAI_API_KEY", None)
 CONVERSATION_WARMUP_ENABLED = os.environ.get(
     "OMNIVOICE_CONVERSATION_WARMUP_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
@@ -882,9 +890,24 @@ def _require_conversation_service() -> ConversationService:
 
 
 def _create_conversation_service() -> ConversationService:
-    from assistant_backends import OllamaAssistantBackend
     from asr import FasterWhisperASR
-    from ollama import AsyncClient
+
+    if LLM_BACKEND == "openai":
+        from assistant_backends import OpenAIAssistantBackend
+        from openai import AsyncOpenAI
+
+        api_key = OPENAI_API_KEY or "not-used"
+        assistant_backend: Any = OpenAIAssistantBackend(
+            AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=api_key),
+            OPENAI_MODEL,
+        )
+    else:
+        from assistant_backends import OllamaAssistantBackend
+        from ollama import AsyncClient
+
+        assistant_backend = OllamaAssistantBackend(
+            AsyncClient(host=OLLAMA_HOST), OLLAMA_MODEL
+        )
 
     return ConversationService(
         FasterWhisperASR(
@@ -892,9 +915,7 @@ def _create_conversation_service() -> ConversationService:
             device=ASR_DEVICE,
             compute_type=ASR_COMPUTE_TYPE,
         ),
-        assistant_backend=OllamaAssistantBackend(
-            AsyncClient(host=OLLAMA_HOST), OLLAMA_MODEL
-        ),
+        assistant_backend=assistant_backend,
     )
 
 
@@ -1052,15 +1073,14 @@ if CONVERSATION_WS_ENABLED:
         )
     )
 
-# CORS middleware (enabled when OMNIVOICE_CORS_ORIGINS is set)
-if CORS_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[o.strip() for o in CORS_ORIGINS.split(",")],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# CORS middleware — allow Gradio pages to fetch from the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS.split(",") if CORS_ORIGINS else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1092,7 @@ def _launch_gradio():
     """
     Start the OmniVoice Gradio demo in a background thread.
     Uses the already loaded 'model' global — no extra VRAM.
+    Also starts the conversation test page on a separate port.
     """
     try:
         from omnivoice.cli.demo import build_demo
@@ -1091,11 +1112,12 @@ def _launch_gradio():
             server_port=GRADIO_PORT,
             share=False,
             prevent_thread_lock=False,
+            css="footer {display:none !important}",
         )
 
     thread = threading.Thread(target=_run, name="gradio-ui", daemon=True)
     thread.start()
-    log.info("Gradio UI thread started.")
+    log.info("Gradio UI started on port %d", GRADIO_PORT)
 
 
 # ---------------------------------------------------------------------------
@@ -1385,6 +1407,15 @@ async def _wyoming_read_event(reader: asyncio.StreamReader) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
+
+
+@app.get("/duplex", tags=["UI"])
+async def duplex_ui():
+    """Serve the full-duplex conversation UI."""
+    return FileResponse(
+        path=Path(__file__).parent / "duplex.html",
+        media_type="text/html",
+    )
 
 
 @app.get("/health", tags=["System"])

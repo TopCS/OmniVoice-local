@@ -68,6 +68,50 @@ class OllamaAssistantBackend:
         return _extract_message_text(response)
 
 
+class OpenAIAssistantBackend:
+    def __init__(
+        self,
+        client: Any,
+        model: str,
+        *,
+        system_prompt: str = PHONE_AGENT_SYSTEM_PROMPT,
+    ):
+        self._client = client
+        self._model = model
+        self._system_prompt = system_prompt
+
+    async def generate_response(
+        self,
+        transcript: str,
+        *,
+        session_id: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        language_hint: str | None = None,
+    ) -> str:
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=_build_messages(
+                self._system_prompt,
+                str(transcript).strip(),
+                session_id=session_id,
+                history=history or [],
+                language_hint=language_hint,
+            ),
+            stream=False,
+        )
+        return _openai_extract_message_text(response)
+
+
+def _openai_extract_message_text(response: Any) -> str:
+    choice = response.choices[0] if response.choices else None
+    if choice is None:
+        raise RuntimeError("Assistant backend returned no choices.")
+    content = getattr(choice.message, "content", None)
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Assistant backend returned no usable message content.")
+    return content.strip()
+
+
 def _build_messages(
     system_prompt: str,
     transcript: str,

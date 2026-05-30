@@ -6,15 +6,15 @@ Based on [OmniVoice](https://github.com/k2-fsa/OmniVoice) — zero-shot multilin
 
 ## Overview
 
-The server loads OmniVoice once and exposes it through four interfaces simultaneously:
+The server loads OmniVoice once and exposes it through multiple interfaces simultaneously:
 
-- **Gradio Web UI** (port `8001`) — the built-in OmniVoice demo with voice cloning and voice design tabs
 - **REST API** (port `8000`) — FastAPI with JSON and multipart/form-data endpoints, full parameter control
 - **OpenAI-Compatible API** (port `8000`) — drop-in replacement for the OpenAI TTS API (`/v1/audio/speech`, `/v1/models`), works with the official OpenAI SDK
-- **Wyoming TCP API** (port `10200`) — Home Assistant compatible TTS service for Assist pipelines
 - **WebSocket Streaming API** (port `8000`) — sentence-level progressive audio streaming (`/ws/tts`)
+- **Full-Duplex Conversation** (port `8000`) — real-time bidirectional voice conversation via `/ws/conversation` with browser-based test UI at `/duplex`
+- **Wyoming TCP API** (port `10200`) — Home Assistant compatible TTS service for Assist pipelines
 
-All four share the same model instance — no extra VRAM.
+All interfaces share the same model instance — no extra VRAM.
 
 **Three generation modes:**
 
@@ -167,6 +167,17 @@ The client prints each `audio_chunk` / `done` event as JSON and plays the matchi
 ### Experimental full duplex conversation client
 
 `examples/ws_duplex_client.py` is an experimental workstation-side client for `/ws/conversation`. It captures 16 kHz microphone audio, uses local Silero VAD to bracket turns, and plays the assistant's streamed 24 kHz PCM response through the local speakers.
+
+**Browser-based test UI:** A standalone HTML test page is available at `http://localhost:8000/duplex`. This page provides a web interface for testing full-duplex conversations directly in your browser without requiring the Python client. The page automatically detects the WebSocket URL and loads available voices.
+
+**HTTPS requirement for microphone access:** Modern browsers require HTTPS (or WSS) for microphone access via `getUserMedia()`, except on `localhost`. For remote testing over HTTPS, use a tunneling service like ngrok:
+
+```bash
+# Install ngrok from https://ngrok.com/download
+ngrok http 8000
+```
+
+ngrok will provide an HTTPS URL (e.g., `https://abc123.ngrok.io`). Open `https://abc123.ngrok.io/duplex` in your browser to access the full-duplex test UI with microphone support.
 
 Caveats:
 
